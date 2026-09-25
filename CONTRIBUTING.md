@@ -1,0 +1,162 @@
+# 🤝 CONTRIBUTING — Team Workflow Rules
+
+**Repo:** https://github.com/AbhijitK20/Business_entity_resolution
+**Team:** Abhijit · Vishwesh · Karan
+
+> ⚠️ **`main` is protected. Nobody pushes directly to `main` — including the lead.**
+> 🔑 **Only Abhijit merges PRs.** Everyone else: branch → commit → push → open PR → wait.
+
+---
+
+## 1. The Rule
+
+```
+main  ← protected. Only merges via Pull Request with review.
+ │
+ ├── feat/blocking-*      ← Vishwesh
+ ├── feat/features-*      ← Karan
+ ├── feat/model-*         ← Abhijit
+ └── docs/*               ← anyone
+```
+
+**Every change goes through a branch + PR.** No exceptions after hour 14 of the hackathon.
+
+---
+
+## 2. Daily Workflow
+
+### Start your work
+```bash
+git checkout main
+git pull                                    # get latest
+git checkout -b feat/<your-area>/<topic>    # e.g. feat/blocking/indic-transliteration
+```
+
+### While working
+```bash
+git add <files>
+git commit -m "feat(blocking): add Indic transliteration
+
+- port ITRANS transliteration with schwa deletion
+- covers 9 script blocks
+- unit tests: राम मार्केटिंग → ram marketing"
+```
+
+**Commit message convention:** `type(area): short description`
+- `feat` new capability · `fix` bug · `docs` documentation · `test` tests · `refactor` cleanup · `perf` speed
+
+### Before pushing
+```bash
+python tests/test_smoke.py                  # must PASS
+python tests/test_<your_module>.py          # your module's tests
+```
+
+### Push + open PR
+```bash
+git push -u origin feat/<your-area>/<topic>
+gh pr create --fill --base main
+```
+
+### PR rules
+| Rule | Detail |
+|------|--------|
+| **Title** | Same convention as commits: `feat(blocking): ...` |
+| **Description** | What changed · evidence (measured numbers) · what to verify |
+| **Reviewers** | Tag Abhijit; teammates may also review/approve |
+| **Tests** | `tests/test_smoke.py` must pass in the PR description |
+| **Evidence** | Any performance claim needs a measured number attached |
+| **Merge** | 🔑 **ONLY Abhijit merges.** Collaborators never click merge. |
+| **Delete branch** | Abhijit deletes the branch after merge (or `--delete-branch`) |
+
+### After merge
+```bash
+git checkout main && git pull
+git branch -d feat/<your-area>/<topic>
+```
+
+---
+
+## 3. File Ownership (avoid conflicts)
+
+| Member | Owns (only they edit) |
+|--------|----------------------|
+| **Vishwesh** | `src/normalize.py`, `src/blocking.py`, `tests/test_normalize.py`, `tests/test_blocking.py` |
+| **Karan** | `src/features.py`, `scripts/evaluate.py`, `scripts/make_synthetic_data.py`, `tests/test_features.py`, `docs/feature_report.md` |
+| **Abhijit** | `src/pipeline.py`, `src/model.py`, `src/training.py`, `src/decision.py`, `src/data_loader.py`, `utils/`, package assembly |
+
+**Frozen interfaces** (MASTERPLAN §7) change only by team agreement — announce in chat first.
+
+**Shared docs** (`MASTERPLAN.md`, `TASK_BREAKDOWN.md`, `docs/*.md`): anyone can PR, but keep edits scoped.
+
+---
+
+## 4. What NOT to Commit
+
+`.gitignore` already blocks these — never force-add them:
+- `data/` (dataset — large, and we must not redistribute it)
+- `research/`, `peoples prototype/`, `official/` (cloned reference repos)
+- `venv/`, `__pycache__/`, `*.pkl`, `output/`, `*.zip`, `.env`
+
+---
+
+## 5. Emergency Rule
+
+If `main` is broken and blocking everyone:
+1. Post in chat immediately: what's broken, what you need
+2. **Do not** push a fix directly to `main` — open a PR and tag Abhijit
+3. **Only Abhijit merges** — he can merge the hotfix PR immediately (admin merge is enabled)
+4. Announce the fix in chat once merged
+
+---
+
+## 6. Submission-Day Exception
+
+Only `output/matching_results.tsv` uploads happen on the competition portal — that's not a git push. The repo stays PR-only the whole time.
+
+---
+
+## 7. Practical Notes on Branch Protection
+
+`main` is protected with:
+- **1 approving review required** for non-admins (stale reviews dismissed on new commits)
+- **`enforce_admins: false`** — **Abhijit** (the only admin) can merge without waiting for an approval
+- **No force pushes, no branch deletion**
+- **Collaborators (Vishwesh, Karan) cannot push to `main`** — they must use PRs
+
+### Who can do what
+| Action | Abhijit | Vishwesh / Karan | Agent (AI) |
+|--------|---------|------------------|------------|
+| Push to `feat/*` branch | ✅ | ✅ | ✅ |
+| Open PR | ✅ | ✅ | ✅ |
+| Approve a PR | ✅ | ✅ | ❌ |
+| **Merge to `main`** | ✅ **only** | ❌ | ❌ |
+| Push directly to `main` | ❌ (use PR) | ❌ | ❌ |
+
+### How Abhijit merges
+```bash
+# list open PRs
+gh pr list
+
+# review the diff
+gh pr diff <number>
+
+# merge (squash + delete branch)
+gh pr merge <number> --squash --delete-branch
+```
+
+### If GitHub blocks the merge with "review required"
+That means `enforce_admins` got re-enabled. As the admin you can either:
+1. Have a teammate approve the PR, or
+2. Re-run the admin merge:
+```bash
+gh api --method DELETE repos/AbhijitK20/Business_entity_resolution/branches/main/protection/enforce_admins
+gh pr merge <number> --squash --delete-branch
+# enforce_admins stays off so you can keep merging solo
+```
+
+### To let teammates approve PRs
+Add them as collaborators once (need their GitHub usernames):
+```bash
+gh api --method PUT repos/AbhijitK20/Business_entity_resolution/collaborators/<username> -f permission=push
+```
+Collaborators with `push` permission can review and approve PRs but **cannot push to protected `main` and must not merge**.
