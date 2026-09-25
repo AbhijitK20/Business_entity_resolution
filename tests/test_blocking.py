@@ -679,12 +679,17 @@ def test_phonetic_forward_retrieval():
 def test_phonetic_oversized_bucket_dropped():
     # REGRESSION (bucket safety): a hot Soundex bucket must not explode
     # candidates — same "drop buckets >30" convention as the key legs.
+    # NOTE: the phonetic leg has TWO independent guards, so lifting the bucket
+    # cap alone is not enough to admit a large bucket — top_k still applies.
     t = ["smith"] * 40
     ids = [f"S2-{i}" for i in range(40)]
     dropped = _phonetic(["smith"], t, ids)          # bucket 40 > default 30
     assert 0 not in dropped, f"oversized bucket not dropped: {dict(dropped)}"
-    kept = _phonetic(["smith"], t, ids, max_bucket=40)
+    kept = _phonetic(["smith"], t, ids, max_bucket=40, top_k=40)
     assert len(kept[0]) == 40, dict(kept)
+    # bucket cap lifted but per-query cap still binding
+    capped = _phonetic(["smith"], t, ids, max_bucket=40)
+    assert len(capped[0]) == 30, dict(capped)
 
 
 def test_phonetic_not_one_to_one_many_to_many():
@@ -749,13 +754,16 @@ def test_initialism_bucket_multiple_candidates():
 
 def test_initialism_oversized_bucket_dropped():
     # REGRESSION (bucket safety): hot initialism bucket (>30) is dropped.
-    _require()
+    # Two independent guards apply, so lifting max_bucket alone still leaves
+    # top_k binding.
     t = ["Alpha Beta Gamma"] * 40          # all map to initialism "ABG"
     ids = [f"S2-{i}" for i in range(40)]
     dropped = initialism_blocking(["ABG"], t, ids)
     assert 0 not in dropped, f"oversized bucket not dropped: {dict(dropped)}"
-    kept = initialism_blocking(["ABG"], t, ids, max_bucket=40)
+    kept = initialism_blocking(["ABG"], t, ids, max_bucket=40, top_k=40)
     assert len(kept[0]) == 40, dict(kept)
+    capped = initialism_blocking(["ABG"], t, ids, max_bucket=40)
+    assert len(capped[0]) == 20, dict(capped)
 
 
 def test_initialism_no_match_zero_candidate_absent():

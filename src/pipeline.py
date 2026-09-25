@@ -27,9 +27,9 @@ from .blocking import (
     tfidf_blocking_candidates, phonetic_blocking, initialism_blocking,
     exact_blocking, minhash_lsh_candidates, address_tfidf_candidates,
     union_candidates, measure_blocking_quality,
-    bidirectional_tfidf, key_blocking, cap_candidates,
+    bidirectional_tfidf, key_blocking, cap_candidates, cap_candidates_scored,
 )
-from .features import compute_features_batch, FEATURE_NAMES
+from .features import compute_features_batch, compute_features_vectorized, FEATURE_NAMES
 from .training import (
     construct_training_pairs, compute_pair_features,
 )
@@ -44,11 +44,23 @@ class EntityResolutionPipeline:
     """End-to-end entity resolution pipeline."""
 
     def __init__(self, data_dir: str, output_dir: str = "output",
-                 fast_mode: bool = False):
+                 fast_mode: bool = False, max_candidates: int = 50,
+                 use_dense_cap: bool = True,
+                 embedding_cache: str = "local_data/embeddings",
+                 dense_model: str = None):
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.fast_mode = fast_mode  # reduce Optuna trials for smoke-testing
+        # Per-S1 candidate budget + ranking. Measured on the real sampled world:
+        # scored dense reranking @50 keeps recall 0.8917 vs 0.291 for a raw cap.
+        self.max_candidates = max_candidates
+        self.use_dense_cap = use_dense_cap
+        self.embedding_cache = embedding_cache
+        if dense_model is None:
+            from .dense_blocking import MULTILINGUAL_MODEL
+            dense_model = MULTILINGUAL_MODEL
+        self.dense_model = dense_model
 
         self.train_data = None
         self.test_data = None
@@ -98,16 +110,21 @@ class EntityResolutionPipeline:
         # Step 5: Construct training data
         print("\n[5/10] Constructing training data...")
         pairs, train_pairs, val_pairs = construct_training_pairs(
-            self.train_data["train_s1"], s2_s3_train, ground_truth
+            self.train_data["train_s1"], s2_s3_train, ground_truth,
+            candidates=candidates_train,
         )
         
         # Compute features
         print("Computing features for training pairs...")
         train_features = compute_pair_features(
-            train_pairs, self.train_data["train_s1"], s2_s3_train
+            train_pairs, self.train_data["train_s1"], s2_s3_train,
+            use_dense=self.use_dense_cap, embedding_cache=self.embedding_cache,
+            dense_model=self.dense_model,
         )
         val_features = compute_pair_features(
-            val_pairs, self.train_data["train_s1"], s2_s3_train
+            val_pairs, self.train_data["train_s1"], s2_s3_train,
+            use_dense=self.use_dense_cap, embedding_cache=self.embedding_cache,
+            dense_model=self.dense_model,
         )
         
         X_train = train_features[FEATURE_NAMES].values
@@ -130,26 +147,48 @@ class EntityResolutionPipeline:
             n_trials=3 if self.fast_mode else 20,
         )
         
-        # Step 8: Calibrate + optimize threshold (macro F_0.5 — matches leaderboard)
-        print("\n[8/10] Calibrating probabilities + optimizing macro F_0.5...")
+        # Step 8: Honest validation on held-out entities — full candidate sets
+        # + decision layer — and calibration on that same distribution. The
+        # training-pair validation set is far easier (0.99 vs 0.81 held-out),
+        # and expected-F0.5 decisions depend on calibrated probabilities.
+        print("\n[8/10] Validation inference (held-out entities, full candidates)...")
         try:
-            from .decision import fit_isotonic
-            self.calibrator = fit_isotonic(meta_val_proba, y_val)
-            cal_val_proba = self.calibrator(meta_val_proba)
-            print("  Isotonic calibration fitted on validation predictions")
-        except Exception as exc:  # noqa: BLE001 — calibration must never block a run
-            print(f"  WARNING: calibration failed ({exc}); using raw probabilities")
-            self.calibrator = None
-            cal_val_proba = meta_val_proba
+            from .decision import (
+                fit_isotonic, select_sets_expected_f05, macro_f05,
+            )
+            val_entity_ids = set(val_pairs["s1_entity_id"])
+            val_out = self._validation_inference(
+                candidates_train, ground_truth, val_entity_ids)
+            self.calibrator = fit_isotonic(
+                val_out["meta_proba"], val_out["labels"])
+            cal_val = self.calibrator(val_out["meta_proba"])
+            decisions = select_sets_expected_f05(
+                val_out["pair_s1_ids"], val_out["pair_cand_ids"], cal_val,
+                anchor_ids=val_out["val_s1_ids"])
+            honest_macro = macro_f05(
+                val_out["truth"],
+                {sid: set(decisions.get(sid, []))
+                 for sid in val_out["val_s1_ids"]},
+            )
+            print(f"  Honest val macro F_0.5 (decision layer, calibrated): "
+                  f"{honest_macro:.4f}")
+        except Exception as exc:  # noqa: BLE001 — validation must never block a run
+            print(f"  WARNING: validation inference failed ({exc}); "
+                  f"falling back to pair-level calibration")
+            try:
+                from .decision import fit_isotonic
+                self.calibrator = fit_isotonic(meta_val_proba, y_val)
+            except Exception:  # noqa: BLE001
+                self.calibrator = None
 
+        # Pair-level metrics (compatibility/reporting only)
         val_s1_ids = val_features["s1_entity_id"].tolist()
         self.best_threshold, best_macro = find_best_macro_f05_threshold(
-            y_val, cal_val_proba, val_s1_ids
+            y_val, meta_val_proba, val_s1_ids
         )
         _, best_pair_f05 = find_best_f05_threshold(y_val, meta_val_proba)
-        print(f"Best threshold: {self.best_threshold:.2f}")
-        print(f"  macro F_0.5 (val, calibrated): {best_macro:.4f}")
-        print(f"  pair  F_0.5 (val, raw):        {best_pair_f05:.4f}")
+        print(f"  pair-level: threshold={self.best_threshold:.2f} "
+              f"macro F_0.5={best_macro:.4f} pair F_0.5={best_pair_f05:.4f}")
         
         # Step 9: Run inference on test
         print("\n[9/10] Running inference on test set...")
@@ -164,6 +203,48 @@ class EntityResolutionPipeline:
         print(f"Output files in: {self.output_dir}")
         print("=" * 60)
     
+    def _cap_candidates(
+        self,
+        candidates: Dict[int, set],
+        s1_names: list,
+        gallery_names: list,
+        gallery_ids: list,
+    ) -> Dict[int, set]:
+        """Apply the per-S1 candidate budget with similarity ranking.
+
+        Prefers dense (e5) reranking when the embedding stack is available;
+        falls back to fuzzy scoring, then to a raw cap as a last resort.
+        """
+        if self.use_dense_cap:
+            try:
+                from .dense_blocking import encode_texts
+                q_emb = encode_texts(
+                    s1_names, model_name=self.dense_model,
+                    cache_dir=self.embedding_cache, role="query",
+                    show_progress=False,
+                )
+                g_emb = encode_texts(
+                    gallery_names, model_name=self.dense_model,
+                    cache_dir=self.embedding_cache, role="target",
+                    show_progress=False,
+                )
+                print(f"  Scored cap: dense rerank @{self.max_candidates}/S1 "
+                      f"(multilingual-e5-small)")
+                return cap_candidates_scored(
+                    candidates, s1_names, gallery_names, gallery_ids,
+                    max_per_query=self.max_candidates,
+                    dense_query_emb=q_emb, dense_target_emb=g_emb,
+                    dense_weight=1.0, verbose=True,
+                )
+            except ImportError as e:
+                print(f"  Scored cap: dense unavailable ({e}); using fuzzy")
+
+        print(f"  Scored cap: fuzzy rerank @{self.max_candidates}/S1")
+        return cap_candidates_scored(
+            candidates, s1_names, gallery_names, gallery_ids,
+            max_per_query=self.max_candidates, verbose=True,
+        )
+
     def _generate_candidates(
         self,
         s1_df: pd.DataFrame,
@@ -187,11 +268,13 @@ class EntityResolutionPipeline:
         print("  Layer 1: Bidirectional TF-IDF (adaptive-K)...")
         c1, _ = bidirectional_tfidf(s1_names, s2_s3_names, s2_s3_ids)
         
-        # Layer 2: Token-sorted TF-IDF
+        # Layer 2: Token-sorted TF-IDF (top_k cap required at scale: without
+        # it this leg produced 78M candidates on the 55K-entity sampled world)
         print("  Layer 2: Token-sorted blocking...")
         s1_sorted = [" ".join(sorted(n.split())) for n in s1_names]
         s2_s3_sorted = [" ".join(sorted(n.split())) for n in s2_s3_names]
-        c2 = tfidf_blocking_candidates(s1_sorted, s2_s3_sorted, s2_s3_ids, threshold=0.25)
+        c2 = tfidf_blocking_candidates(s1_sorted, s2_s3_sorted, s2_s3_ids,
+                                       threshold=0.25, top_k=30)
         
         # Layer 3: Phonetic (Soundex + Metaphone)
         print("  Layer 3: Phonetic blocking...")
@@ -203,7 +286,8 @@ class EntityResolutionPipeline:
         
         # Layer 5: Address TF-IDF
         print("  Layer 5: Address TF-IDF blocking...")
-        c5 = address_tfidf_candidates(s1_addrs, s2_s3_addrs, s2_s3_ids, threshold=0.25)
+        c5 = address_tfidf_candidates(s1_addrs, s2_s3_addrs, s2_s3_ids,
+                                      threshold=0.25, top_k=30)
         
         # Layer 6: Exact keys — address / name-core / PIN-ZIP (SABER + SIBAM)
         print("  Layer 6: Exact key blocking (address/name/PIN)...")
@@ -213,9 +297,11 @@ class EntityResolutionPipeline:
         print("  Layer 7: MinHash LSH blocking...")
         c7 = minhash_lsh_candidates(s1_names, s2_s3_names, s2_s3_ids, threshold=0.3)
         
-        # Union all candidates + final per-entity budget
+        # Union all candidates + scored per-entity budget
         candidates = union_candidates(c1, c2, c3, c4, c5, c6, c7)
-        candidates = cap_candidates(candidates, max_per_query=30)
+        candidates = self._cap_candidates(
+            candidates, s1_names, s2_s3_names, s2_s3_ids
+        )
         
         total_pairs = len(s1_names) * len(s2_s3_names)
         if ground_truth is not None:
@@ -229,6 +315,126 @@ class EntityResolutionPipeline:
         
         return candidates
     
+    def _predict_pair_proba(
+        self,
+        s1_df: pd.DataFrame,
+        s2_s3_df: pd.DataFrame,
+        pair_s1_idx: list,
+        pair_s2_idx: list,
+    ):
+        """Features + ensemble + meta probabilities for explicit candidate pairs.
+
+        Returns (features_df, meta_proba). Dense cosine is always computed when
+        use_dense_cap is on — the model was trained with real values.
+        """
+        s1_names = s1_df["business_name_clean"].fillna("").tolist()
+        s1_addrs = s1_df["business_address_clean"].fillna("").tolist()
+        s1_countries = s1_df["country_clean"].fillna("").tolist()
+        s2_s3_names = s2_s3_df["business_name_clean"].fillna("").tolist()
+        s2_s3_addrs = s2_s3_df["business_address_clean"].fillna("").tolist()
+        s2_s3_countries = s2_s3_df["country_clean"].fillna("").tolist()
+        s2_s3_ids = s2_s3_df["entity_id"].tolist()
+
+        pairs_df = pd.DataFrame({"s1_idx": pair_s1_idx, "s2_s3_idx": pair_s2_idx})
+        if len(pairs_df) > 20_000:
+            features_df = compute_features_vectorized(
+                pairs_df, s1_names, s1_addrs, s1_countries,
+                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+            )
+        else:
+            features_df = compute_features_batch(
+                pairs_df, s1_names, s1_addrs, s1_countries,
+                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+            )
+
+        if self.use_dense_cap:
+            try:
+                from .dense_blocking import encode_texts
+                q_emb = encode_texts(
+                    s1_names, model_name=self.dense_model,
+                    cache_dir=self.embedding_cache, role="query",
+                    show_progress=False,
+                )
+                g_emb = encode_texts(
+                    s2_s3_names, model_name=self.dense_model,
+                    cache_dir=self.embedding_cache, role="target",
+                    show_progress=False,
+                )
+                s1_arr = pairs_df["s1_idx"].to_numpy()
+                s2_arr = pairs_df["s2_s3_idx"].to_numpy()
+                cos = np.empty(len(pairs_df), dtype=np.float32)
+                step = 200_000
+                for start in range(0, len(pairs_df), step):
+                    end = min(start + step, len(pairs_df))
+                    cos[start:end] = np.einsum(
+                        "ij,ij->i",
+                        q_emb[s1_arr[start:end]], g_emb[s2_arr[start:end]],
+                    )
+                features_df["name_dense_cosine"] = cos
+            except Exception as exc:  # noqa: BLE001 — never block inference
+                print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
+
+        X = features_df[FEATURE_NAMES].values
+        lgb_proba = self.models["lgb"]["model"].predict_proba(X)[:, 1]
+        xgb_proba = self.models["xgb"]["model"].predict_proba(X)[:, 1]
+        rf_proba = self.models["rf"]["model"].predict_proba(X)[:, 1]
+        X_meta = np.column_stack([lgb_proba, xgb_proba, rf_proba])
+        meta_proba = self.meta_model.predict_proba(X_meta)[:, 1]
+        return features_df, meta_proba
+
+    def _validation_inference(
+        self,
+        candidates_train: Dict[int, set],
+        ground_truth: Dict[str, list],
+        val_entity_ids: set,
+    ) -> dict:
+        """Honest validation: full candidate sets + model + decision layer on
+        held-out entities.
+
+        The training-pair validation set (positives + sampled negatives) is far
+        easier than the real 50-candidates/S1 distribution (val macro F_0.5
+        0.99 vs 0.81 held-out). Calibration and reporting must use the full
+        candidate distribution or the expected-F0.5 decision is misled.
+        """
+        from .decision import select_sets_expected_f05, macro_f05
+
+        s1_df = self.train_data["train_s1"]
+        s2_s3 = combine_sources(
+            self.train_data["train_s2"], self.train_data["train_s3"]
+        )
+        s1_ids = s1_df["entity_id"].tolist()
+        s2_ids = s2_s3["entity_id"].tolist()
+        s2_pos = {e: i for i, e in enumerate(s2_ids)}
+
+        val_idx = [i for i, sid in enumerate(s1_ids) if sid in val_entity_ids]
+        pair_s1_idx, pair_s2_idx = [], []
+        for i in val_idx:
+            for cid in candidates_train.get(i, ()):
+                pair_s1_idx.append(i)
+                pair_s2_idx.append(s2_pos[cid])
+
+        print(f"  Validation inference: {len(val_idx):,} entities, "
+              f"{len(pair_s1_idx):,} candidate pairs")
+        features_df, meta_proba = self._predict_pair_proba(
+            s1_df, s2_s3, pair_s1_idx, pair_s2_idx)
+
+        val_s1_ids = [s1_ids[i] for i in val_idx]
+        pair_s1_ids = [s1_ids[i] for i in features_df["s1_idx"].tolist()]
+        pair_cand_ids = features_df["s2_s3_id"].tolist()
+        labels = np.array([
+            1 if cid in set(ground_truth.get(sid, [])) else 0
+            for sid, cid in zip(pair_s1_ids, pair_cand_ids)
+        ], dtype=np.int8)
+        truth = {sid: set(ground_truth.get(sid, [])) for sid in val_s1_ids}
+        return {
+            "pair_s1_ids": pair_s1_ids,
+            "pair_cand_ids": pair_cand_ids,
+            "meta_proba": meta_proba,
+            "labels": labels,
+            "val_s1_ids": val_s1_ids,
+            "truth": truth,
+        }
+
     def _run_inference(self):
         """Run inference on test set."""
         s2_s3_test = combine_sources(
@@ -258,34 +464,11 @@ class EntityResolutionPipeline:
             self.test_predictions = {sid: [] for sid in self.test_data["test_s1"]["entity_id"]}
             return
         
-        # Compute features
-        s1_df = self.test_data["test_s1"]
-        s1_names = s1_df["business_name_clean"].fillna("").tolist()
-        s1_addrs = s1_df["business_address_clean"].fillna("").tolist()
-        s1_countries = s1_df["country_clean"].fillna("").tolist()
-        
-        s2_s3_names = s2_s3_test["business_name_clean"].fillna("").tolist()
-        s2_s3_addrs = s2_s3_test["business_address_clean"].fillna("").tolist()
-        s2_s3_countries = s2_s3_test["country_clean"].fillna("").tolist()
-        s2_s3_ids = s2_s3_test["entity_id"].tolist()
-        
+        # Compute features + ensemble probabilities
         print(f"  Computing features for {len(pair_s1_idx)} candidate pairs...")
-        pairs_df = pd.DataFrame({"s1_idx": pair_s1_idx, "s2_s3_idx": pair_s2_idx})
-        features_df = compute_features_batch(
-            pairs_df, s1_names, s1_addrs, s1_countries,
-            s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
-        )
-        
-        X_test = features_df[FEATURE_NAMES].values
-        
-        # Stack base predictions
-        lgb_proba = self.models["lgb"]["model"].predict_proba(X_test)[:, 1]
-        xgb_proba = self.models["xgb"]["model"].predict_proba(X_test)[:, 1]
-        rf_proba = self.models["rf"]["model"].predict_proba(X_test)[:, 1]
-        
-        X_meta = np.column_stack([lgb_proba, xgb_proba, rf_proba])
-        meta_proba = self.meta_model.predict_proba(X_meta)[:, 1]
-        
+        features_df, meta_proba = self._predict_pair_proba(
+            self.test_data["test_s1"], s2_s3_test, pair_s1_idx, pair_s2_idx)
+
         # Calibrate before the decision (isotonic fitted on validation)
         if self.calibrator is not None:
             decision_proba = self.calibrator(meta_proba)
@@ -293,7 +476,7 @@ class EntityResolutionPipeline:
             decision_proba = meta_proba
         
         # --- Entity-level decision: exclusivity + expected-F0.5 --------------
-        test_s1_ids = s1_df["entity_id"].tolist()
+        test_s1_ids = self.test_data["test_s1"]["entity_id"].tolist()
         pair_s1_ids = [test_s1_ids[i] for i in features_df["s1_idx"].tolist()]
         pair_cand_ids = features_df["s2_s3_id"].tolist()
         
@@ -367,9 +550,24 @@ def main():
         "OUTPUT_DIR", "/home/abhijitk20/Amazon ML/output"))
     parser.add_argument("--fast", action="store_true",
                         help="Fast mode: few Optuna trials (for smoke tests)")
+    parser.add_argument("--max-candidates", type=int, default=50,
+                        help="Per-S1 candidate budget after scored reranking")
+    parser.add_argument("--no-dense-cap", action="store_true",
+                        help="Disable dense (e5) reranking; use fuzzy scoring")
+    parser.add_argument("--embedding-cache", default="local_data/embeddings",
+                        help="Directory for cached embedding arrays")
+    parser.add_argument("--dense-model", default=None,
+                        help="Encoder for dense features/reranking "
+                             "(default: intfloat/multilingual-e5-small)")
     args = parser.parse_args()
 
-    pipeline = EntityResolutionPipeline(args.data_dir, args.output_dir, fast_mode=args.fast)
+    pipeline = EntityResolutionPipeline(
+        args.data_dir, args.output_dir, fast_mode=args.fast,
+        max_candidates=args.max_candidates,
+        use_dense_cap=not args.no_dense_cap,
+        embedding_cache=args.embedding_cache,
+        dense_model=args.dense_model,
+    )
     pipeline.run()
 
 

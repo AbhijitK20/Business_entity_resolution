@@ -1,0 +1,59 @@
+{
+  "world": "tests/world_2p5",
+  "device": "cuda",
+  "n_s1": 55169,
+  "n_gallery": 443927,
+  "total_gt": 191103,
+  "models": {
+    "arctic": {
+      "model_name": "Snowflake/snowflake-arctic-embed-xs",
+      "encode_seconds": 3.8,
+      "search_seconds": 3.1,
+      "recall": [
+        {
+          "k": 20,
+          "matches_retained": 141126,
+          "total_matches": 191103,
+          "recall": 0.7385
+        },
+        {
+          "k": 30,
+          "matches_retained": 144883,
+          "total_matches": 191103,
+          "recall": 0.7581
+        },
+        {
+          "k": 50,
+          "matches_retained": 149464,
+          "total_matches": 191103,
+          "recall": 0.7821
+        }
+      ]
+    },
+    "e5": {
+      "model_name": "intfloat/multilingual-e5-small",
+      "encode_seconds": 2.5,
+      "search_seconds": 2.7,
+      "recall": [
+        {
+          "k": 20,
+          "matches_retained": 149133,
+          "total_matches": 191103,
+          "recall": 0.7804
+        },
+        {
+          "k": 30,
+          "matches_retained": 152974,
+          "total_matches": 191103,
+          "recall": 0.8005
+        },
+        {
+          "k": 50,
+          "matches_retained": 157234,
+          "total_matches": 191103,
+          "recall": 0.8228
+        }
+      ]
+    }
+  }
+}

@@ -126,15 +126,27 @@ def _take_bucket(
     q_idx: int,
     bucket: List[str],
     max_bucket,
+    top_k=None,
 ) -> None:
     """Add an inverted-index bucket to candidates iff it is non-empty and fits.
 
-    Oversized buckets are dropped as too generic — the same convention as the
-    key legs (BLUEPRINT §2.2: "drop buckets >30"). ``max_bucket=None`` disables
-    the cap.
+    Two independent scale guards, both required:
+
+    ``max_bucket`` drops a bucket that is too generic to be evidence at all
+    (e.g. every "John Smith" shares a Soundex code) — the key-leg convention
+    from BLUEPRINT §2.2. ``max_bucket=None`` disables this guard.
+
+    ``top_k`` caps how much of a surviving bucket ONE query may take. Without
+    it a single query can absorb a whole 30-item Soundex bucket *and* a whole
+    30-item Metaphone bucket, so one leg can silently contribute 60 candidates
+    and evict true matches from the per-query budget. ``top_k=None`` disables
+    this guard.
     """
-    if bucket and (max_bucket is None or len(bucket) <= max_bucket):
-        candidates[q_idx].update(bucket)
+    if not bucket:
+        return
+    if max_bucket is not None and len(bucket) > max_bucket:
+        return
+    candidates[q_idx].update(bucket if top_k is None else bucket[:top_k])
 
 
 def phonetic_blocking(
@@ -142,12 +154,19 @@ def phonetic_blocking(
     target_names: List[str],
     target_ids: List[str],
     max_bucket: int = 30,
+    top_k: int = 30,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using Soundex + Metaphone blocking.
 
     From canonmap: phonetic and soundex blocking strategies.
-    Soundex/metaphone buckets larger than ``max_bucket`` are dropped as too
-    generic (key-leg convention), so a hot bucket cannot explode candidates.
+
+    Scale guards (measured need: without them this leg produced 50M candidates
+    on the 55K-entity sampled world):
+      - buckets larger than ``max_bucket`` are skipped (too generic to be
+        useful evidence — e.g. every "John Smith" shares a Soundex code).
+        Default 30 is the key-leg convention (BLUEPRINT §2.2).
+      - each query keeps at most ``top_k`` candidates per code, so one leg
+        cannot spend the whole per-query budget on a single code
     """
     candidates = defaultdict(set)
 
@@ -167,9 +186,8 @@ def phonetic_blocking(
     for q_idx, name in enumerate(query_names):
         sx = soundex_key(name)
         mp = metaphone_key(name)
-        _take_bucket(candidates, q_idx, target_soundex.get(sx), max_bucket)
-        _take_bucket(candidates, q_idx, target_metaphone.get(mp), max_bucket)
-
+        _take_bucket(candidates, q_idx, target_soundex.get(sx), max_bucket, top_k)
+        _take_bucket(candidates, q_idx, target_metaphone.get(mp), max_bucket, top_k)
     return candidates
 
 
@@ -178,12 +196,14 @@ def initialism_blocking(
     target_names: List[str],
     target_ids: List[str],
     max_bucket: int = 30,
+    top_k: int = 20,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using initialism matching.
 
     From canonmap: bidirectional initialism matching.
-    Initialism buckets larger than ``max_bucket`` are dropped as too generic
-    (key-leg convention).
+
+    Scale guards: skip buckets > ``max_bucket`` (generic acronyms), keep at
+    most ``top_k`` per query.
     """
     candidates = defaultdict(set)
 
@@ -197,8 +217,7 @@ def initialism_blocking(
     # Query
     for q_idx, name in enumerate(query_names):
         init = initialism_key(name)
-        _take_bucket(candidates, q_idx, target_initialisms.get(init), max_bucket)
-
+        _take_bucket(candidates, q_idx, target_initialisms.get(init), max_bucket, top_k)
     return candidates
 
 
@@ -230,10 +249,12 @@ def minhash_lsh_candidates(
     threshold: float = 0.4,
     num_perm: int = 128,
     shingle_size: int = 3,
+    top_k: int = 20,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using MinHash LSH.
     
     From StringMatcher: character n-gram shingles + MinHash + LSH.
+    ``top_k`` caps candidates per query (LSH buckets can be large at scale).
     """
     try:
         from datasketch import MinHash, MinHashLSH
@@ -273,7 +294,7 @@ def minhash_lsh_candidates(
     for q_idx, name in enumerate(query_names):
         mh = make_minhash(name)
         results = lsh.query(mh)
-        for r in results:
+        for r in results[:top_k]:
             t_idx = int(r.split("_")[1])
             candidates[q_idx].add(target_ids[t_idx])
     
@@ -391,6 +412,76 @@ def cap_candidates(
         else:
             kept = sorted(cands, key=str)
         capped[q_idx] = set(kept[:max_per_query])
+    return capped
+
+
+def cap_candidates_scored(
+    candidates: Dict[int, Set[str]],
+    query_names: List[str],
+    target_names: List[str],
+    target_ids: List[str],
+    max_per_query: int = 30,
+    dense_query_emb=None,
+    dense_target_emb=None,
+    dense_weight: float = 0.5,
+    verbose: bool = False,
+) -> Dict[int, Set[str]]:
+    """Rank union candidates by similarity and keep the top-K per query.
+
+    Why: the raw first-K cap collapsed union recall from 0.941 to 0.294 on the
+    sampled world (123,709 of 191,103 matches lost) because candidates were
+    kept in arbitrary insertion order. Ranking by a real similarity signal
+    keeps the true matches in budget.
+
+    Score = (1 - dense_weight) * token_set_ratio/100
+          + dense_weight * (cosine + 1)/2      [when embeddings are provided]
+
+    Uses RapidFuzz's C implementation (``process.extract``, limit=None) so the
+    ~5.9M pairs on the sampled world score in seconds.
+    """
+    name_by_id = dict(zip(target_ids, target_names))
+    idx_by_id = {tid: i for i, tid in enumerate(target_ids)}
+    use_dense = dense_query_emb is not None and dense_target_emb is not None
+
+    capped = {}
+    n_scored = 0
+    for q_idx, cands in candidates.items():
+        if len(cands) <= max_per_query:
+            capped[q_idx] = set(cands)
+            continue
+
+        cand_list = list(cands)
+        q_name = query_names[q_idx] if q_idx < len(query_names) else ""
+
+        # Fuzzy scores. Names are already normalized/lowercased upstream —
+        # RapidFuzz scorers are case-sensitive, so never feed raw casing here.
+        # Pass plain strings (tuple choices break RapidFuzz scoring) and map
+        # the returned index back to the candidate position.
+        fuzzy = np.zeros(len(cand_list), dtype=np.float32)
+        cand_names = [name_by_id.get(t, "") for t in cand_list]
+        for _, score, pos in process.extract(
+            q_name, cand_names, scorer=fuzz.token_set_ratio, limit=None
+        ):
+            fuzzy[pos] = score / 100.0
+
+        if use_dense:
+            t_idx = np.fromiter(
+                (idx_by_id[t] for t in cand_list), dtype=np.int64,
+                count=len(cand_list),
+            )
+            sims = dense_target_emb[t_idx] @ dense_query_emb[q_idx]
+            dense01 = (sims + 1.0) / 2.0
+            score = (1.0 - dense_weight) * fuzzy + dense_weight * dense01
+        else:
+            score = fuzzy
+
+        top = np.argpartition(-score, max_per_query)[:max_per_query]
+        capped[q_idx] = {cand_list[i] for i in top}
+        n_scored += 1
+
+    if verbose:
+        print(f"  [cap_candidates_scored] scored {n_scored} queries "
+              f"(kept all for {len(capped) - n_scored})")
     return capped
 
 
@@ -628,6 +719,12 @@ def measure_blocking_quality(
         s1_ids: list of S1 entity IDs indexed by position (required to map
             idx -> id; without it no truth S1 resolves to a candidate set and
             recall evaluates to 0)
+
+    Note: the denominator is ALL ground-truth matches across every S1 entity —
+    queries with zero candidates correctly count their matches as lost. We
+    therefore iterate ``ground_truth``, never ``candidates``: iterating the
+    latter would silently drop every S1 that produced no candidate and inflate
+    recall.
     """
     matches_retained = 0
     total_matches = 0

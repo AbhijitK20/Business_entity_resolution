@@ -8,3 +8,12 @@ optuna>=3.0.0
 shap>=0.42.0
 jellyfish>=0.11.0
 rapidfuzz>=3.0.0
+datasketch>=1.6.0
+indic-transliteration>=2.3.0
+
+# GPU dense blocking (optional but recommended; CPU fallback works)
+torch>=2.0
+sentence-transformers>=3.0
+transformers>=4.40
+huggingface-hub>=0.23
+faiss-cpu>=1.8

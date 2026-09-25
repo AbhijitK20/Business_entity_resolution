@@ -1,0 +1,42 @@
+{
+  "world": "tests/world_2p5",
+  "union": {
+    "candidate_pairs": 5978094,
+    "reduction_ratio": 0.9998,
+    "matches_retained": 179884,
+    "total_matches": 191103,
+    "pair_recall": 0.9413
+  },
+  "budgets": {
+    "30": {
+      "raw": {
+        "candidate_pairs": 1655070,
+        "reduction_ratio": 0.9999,
+        "matches_retained": 55547,
+        "total_matches": 191103,
+        "pair_recall": 0.2907
+      },
+      "scored_fuzzy": {
+        "candidate_pairs": 1655070,
+        "reduction_ratio": 0.9999,
+        "matches_retained": 154129,
+        "total_matches": 191103,
+        "pair_recall": 0.8065
+      },
+      "scored_dense": {
+        "candidate_pairs": 1655070,
+        "reduction_ratio": 0.9999,
+        "matches_retained": 162082,
+        "total_matches": 191103,
+        "pair_recall": 0.8481
+      },
+      "scored_hybrid": {
+        "candidate_pairs": 1655070,
+        "reduction_ratio": 0.9999,
+        "matches_retained": 156371,
+        "total_matches": 191103,
+        "pair_recall": 0.8183
+      }
+    }
+  }
+}

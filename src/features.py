@@ -297,6 +297,9 @@ def compute_all_features(
     all_feats.update(cross_feats)
     all_feats.update(missing_feats)
     all_feats.update(contradiction_feats)
+    # Dense semantic similarity is computed at the training layer (embeddings
+    # live there); default to 0.0 for direct callers.
+    all_feats["name_dense_cosine"] = 0.0
     
     return all_feats
 
@@ -312,13 +315,13 @@ def compute_features_batch(
     s2_s3_ids: List[str],
 ) -> pd.DataFrame:
     """Compute features for all candidate pairs.
-    
+
     Args:
         pairs: DataFrame with columns [s1_idx, s2_s3_idx]
         s1_names, s1_addrs, s1_countries: S1 field arrays
         s2_s3_names, s2_s3_addrs, s2_s3_countries: S2+S3 field arrays
         s2_s3_ids: S2+S3 entity_id array
-    
+
     Returns:
         DataFrame with feature columns + entity IDs
     """
@@ -346,6 +349,235 @@ def compute_features_batch(
     return pd.DataFrame(results)
 
 
+# ---------------------------------------------------------------------------
+# Vectorized feature computation for scale (SABER's cpdist approach).
+# rapidfuzz.process.cpdist(a, b, scorer=...) is element-wise + multithreaded.
+# Set/phonetic features are precomputed per unique record, then combined.
+# ---------------------------------------------------------------------------
+
+def _precompute_record_features(values: List[str]) -> Dict[str, list]:
+    """Compute per-record token sets, trigrams, phonetics once (dedup by value)."""
+    cache: Dict[str, tuple] = {}
+    out = {"tokens": [], "trigrams": [], "soundex": [], "metaphone": [],
+           "nysiis": [], "digits": [], "is_company": []}
+    for v in values:
+        if v in cache:
+            t, tg, sx, mp, ny, dg, ic = cache[v]
+        else:
+            t = set(v.split())
+            clean = v.replace(" ", "")
+            tg = set(clean[i:i + 3] for i in range(max(len(clean) - 2, 1)))
+            sx = jellyfish.soundex(v) if v else ""
+            mp = jellyfish.metaphone(v) if v else ""
+            ny = jellyfish.nysiis(v) if v else ""
+            dg = set(re.findall(r"\d+", v))
+            from .normalize import is_company_name
+            ic = float(is_company_name(v)) if v else 0.0
+            cache[v] = (t, tg, sx, mp, ny, dg, ic)
+        out["tokens"].append(t)
+        out["trigrams"].append(tg)
+        out["soundex"].append(sx)
+        out["metaphone"].append(mp)
+        out["nysiis"].append(ny)
+        out["digits"].append(dg)
+        out["is_company"].append(ic)
+    return out
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def compute_features_vectorized(
+    pairs: pd.DataFrame,
+    s1_names: List[str],
+    s1_addrs: List[str],
+    s1_countries: List[str],
+    s2_s3_names: List[str],
+    s2_s3_addrs: List[str],
+    s2_s3_countries: List[str],
+    s2_s3_ids: List[str],
+    chunk_size: int = 500_000,
+    dense_query_emb=None,
+    dense_target_emb=None,
+    fuzzy_workers: int = -1,
+) -> pd.DataFrame:
+    """Vectorized pairwise features — designed for millions of pairs.
+
+    Uses rapidfuzz.process.cpdist (element-wise, multithreaded) for all fuzzy
+    string features; per-record set/phonetic features are precomputed once and
+    combined with cheap set operations. Produces the same 35 features as
+    ``compute_all_features``.
+    """
+    from rapidfuzz import process as rf_process
+
+    s1_idx = pairs["s1_idx"].to_numpy()
+    s2_idx = pairs["s2_s3_idx"].to_numpy()
+
+    n1 = [s1_names[i] for i in s1_idx]
+    a1 = [s1_addrs[i] for i in s1_idx]
+    c1 = [s1_countries[i] for i in s1_idx]
+    n2 = [s2_s3_names[i] for i in s2_idx]
+    a2 = [s2_s3_addrs[i] for i in s2_idx]
+    c2 = [s2_s3_countries[i] for i in s2_idx]
+
+    # --- fuzzy string features (element-wise, multithreaded) ---------------
+    feats: Dict[str, np.ndarray] = {}
+    feats["name_token_sort_ratio"] = rf_process.cpdist(n1, n2, scorer=fuzz.token_sort_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["name_partial_ratio"] = rf_process.cpdist(n1, n2, scorer=fuzz.partial_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["name_WRatio"] = rf_process.cpdist(n1, n2, scorer=fuzz.WRatio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["name_jaro_winkler"] = rf_process.cpdist(n1, n2, scorer=distance.JaroWinkler.normalized_similarity, workers=fuzzy_workers, dtype=np.float32)
+    feats["name_edit_ratio"] = rf_process.cpdist(n1, n2, scorer=distance.Levenshtein.normalized_similarity, workers=fuzzy_workers, dtype=np.float32)
+    feats["addr_token_sort_ratio"] = rf_process.cpdist(a1, a2, scorer=fuzz.token_sort_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["addr_partial_ratio"] = rf_process.cpdist(a1, a2, scorer=fuzz.partial_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["addr_WRatio"] = rf_process.cpdist(a1, a2, scorer=fuzz.WRatio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+
+    # --- per-record precomputed sets (dedup by value) ----------------------
+    s1_feat = _precompute_record_features(s1_names)
+    s2_feat = _precompute_record_features(s2_s3_names)
+    s1_addr_feat = _precompute_record_features(s1_addrs)
+    s2_addr_feat = _precompute_record_features(s2_s3_addrs)
+    # combined name+address trigrams must be computed on the concatenation
+    # (cross-boundary trigrams included), matching compute_all_features
+    s1_comb = _precompute_record_features([f"{n} {a}" for n, a in zip(s1_names, s1_addrs)])
+    s2_comb = _precompute_record_features([f"{n} {a}" for n, a in zip(s2_s3_names, s2_s3_addrs)])
+
+    name_jaccard = np.empty(len(pairs), dtype=np.float32)
+    name_trigram = np.empty(len(pairs), dtype=np.float32)
+    name_soundex = np.empty(len(pairs), dtype=np.float32)
+    name_metaphone = np.empty(len(pairs), dtype=np.float32)
+    addr_jaccard = np.empty(len(pairs), dtype=np.float32)
+    addr_trigram = np.empty(len(pairs), dtype=np.float32)
+    combined_trigram = np.empty(len(pairs), dtype=np.float32)
+    surname_diff = np.empty(len(pairs), dtype=np.float32)
+    num_jacc = np.empty(len(pairs), dtype=np.float32)
+    house_eq = np.empty(len(pairs), dtype=np.float32)
+
+    for k in range(len(pairs)):
+        i1, i2 = s1_idx[k], s2_idx[k]
+        # name
+        t1, t2 = s1_feat["tokens"][i1], s2_feat["tokens"][i2]
+        name_jaccard[k] = _jaccard(t1, t2)
+        name_trigram[k] = _jaccard(s1_feat["trigrams"][i1], s2_feat["trigrams"][i2])
+        name_soundex[k] = 1.0 if (s1_feat["soundex"][i1] and s1_feat["soundex"][i1] == s2_feat["soundex"][i2]) else 0.0
+        name_metaphone[k] = 1.0 if (s1_feat["metaphone"][i1] and s1_feat["metaphone"][i1] == s2_feat["metaphone"][i2]) else 0.0
+        # address
+        at1, at2 = s1_addr_feat["tokens"][i1], s2_addr_feat["tokens"][i2]
+        addr_jaccard[k] = _jaccard(at1, at2)
+        addr_trigram[k] = _jaccard(s1_addr_feat["trigrams"][i1], s2_addr_feat["trigrams"][i2])
+        # combined trigram on name+addr (concatenated, matching row-wise)
+        combined_trigram[k] = _jaccard(s1_comb["trigrams"][i1], s2_comb["trigrams"][i2])
+        # surname length diff
+        st1 = s1_names[i1].split()
+        st2 = s2_s3_names[i2].split()
+        sa, sb = (st1[-1] if st1 else ""), (st2[-1] if st2 else "")
+        surname_diff[k] = abs(len(sa) - len(sb)) / max(len(sa), len(sb), 1)
+        # numeric
+        d1, d2 = s1_addr_feat["digits"][i1], s2_addr_feat["digits"][i2]
+        union = d1 | d2
+        num_jacc[k] = (len(d1 & d2) / len(union)) if union else -1.0
+        h1 = min(d1) if d1 else None
+        h2 = min(d2) if d2 else None
+        house_eq[k] = -1.0 if (h1 is None or h2 is None) else (1.0 if h1 == h2 else 0.0)
+
+    feats["name_jaccard"] = name_jaccard
+    feats["name_trigram_jaccard"] = name_trigram
+    feats["name_soundex_match"] = name_soundex
+    feats["name_metaphone_match"] = name_metaphone
+    feats["addr_jaccard"] = addr_jaccard
+    feats["addr_trigram_jaccard"] = addr_trigram
+    feats["combined_trigram"] = combined_trigram
+    feats["surname_length_diff"] = surname_diff
+
+    # --- length ratios + country + missingness + contradictions ------------
+    len1 = np.array([len(x) for x in n1], dtype=np.float32)
+    len2 = np.array([len(x) for x in n2], dtype=np.float32)
+    alen1 = np.array([len(x) for x in a1], dtype=np.float32)
+    alen2 = np.array([len(x) for x in a2], dtype=np.float32)
+    feats["name_length_ratio"] = np.minimum(len1, len2) / np.maximum(np.maximum(len1, len2), 1)
+    feats["addr_length_ratio"] = np.minimum(alen1, alen2) / np.maximum(np.maximum(alen1, alen2), 1)
+
+    c1_arr = np.array(c1, dtype=object)
+    c2_arr = np.array(c2, dtype=object)
+    feats["same_country"] = (c1_arr == c2_arr).astype(np.float32)
+
+    name_present1 = (len1 > 0).astype(np.float32)
+    name_present2 = (len2 > 0).astype(np.float32)
+    addr_present1 = (alen1 > 0).astype(np.float32)
+    addr_present2 = (alen2 > 0).astype(np.float32)
+    feats["name_a_present"] = name_present1
+    feats["name_b_present"] = name_present2
+    feats["addr_a_present"] = addr_present1
+    feats["addr_b_present"] = addr_present2
+    feats["both_names_present"] = name_present1 * name_present2
+    feats["both_addrs_present"] = addr_present1 * addr_present2
+
+    # contradictions
+    country_conflict = ((c1_arr != c2_arr) & (name_present1 > 0) & (name_present2 > 0)).astype(np.float32)
+    num_conflict = np.where((num_jacc >= 0) & (num_jacc == 0), 1.0, 0.0).astype(np.float32)
+    # city conflict: last tokens differ with no containment (only when both have >=2 tokens)
+    city_conflict = np.zeros(len(pairs), dtype=np.float32)
+    for k in range(len(pairs)):
+        ta, tb = a1[k].split(), a2[k].split()
+        if len(ta) >= 2 and len(tb) >= 2:
+            ca, cb = ta[-1], tb[-1]
+            if ca != cb and ca not in cb and cb not in ca:
+                city_conflict[k] = 1.0
+    feats["country_conflict"] = country_conflict
+    feats["addr_number_conflict"] = num_conflict
+    feats["city_conflict"] = city_conflict
+    feats["contradiction_count"] = country_conflict + num_conflict + city_conflict
+
+    # cross features
+    feats["name_addr_WRatio_avg"] = (feats["name_WRatio"] + feats["addr_WRatio"]) / 2
+    feats["name_addr_WRatio_max"] = np.maximum(feats["name_WRatio"], feats["addr_WRatio"])
+    feats["name_addr_WRatio_min"] = np.minimum(feats["name_WRatio"], feats["addr_WRatio"])
+    feats["name_addr_jaccard_avg"] = (name_jaccard + addr_jaccard) / 2
+    feats["is_company"] = np.maximum(
+        np.array(s1_feat["is_company"], dtype=np.float32)[s1_idx],
+        np.array(s2_feat["is_company"], dtype=np.float32)[s2_idx],
+    )
+
+    # phonetic voting (soundex + metaphone + nysiis) — all precomputed
+    phonetic_vote = np.empty(len(pairs), dtype=np.float32)
+    for k in range(len(pairs)):
+        i1, i2 = s1_idx[k], s2_idx[k]
+        matches = total = 0
+        sx1, sx2 = s1_feat["soundex"][i1], s2_feat["soundex"][i2]
+        mp1, mp2 = s1_feat["metaphone"][i1], s2_feat["metaphone"][i2]
+        ny1, ny2 = s1_feat["nysiis"][i1], s2_feat["nysiis"][i2]
+        if sx1 and sx2:
+            total += 1; matches += int(sx1 == sx2)
+        if mp1 and mp2:
+            total += 1; matches += int(mp1 == mp2)
+        if ny1 and ny2:
+            total += 1; matches += int(ny1 == ny2)
+        phonetic_vote[k] = matches / total if total else 0.0
+    feats["name_phonetic_vote"] = phonetic_vote
+
+    # --- dense semantic cosine (optional; chunked to bound memory) ---------
+    if dense_query_emb is not None and dense_target_emb is not None:
+        cos = np.empty(len(pairs), dtype=np.float32)
+        step = 200_000  # 200K x 384 x 4B x 2 arrays ~= 0.6GB temporaries
+        for start in range(0, len(pairs), step):
+            end = min(start + step, len(pairs))
+            qv = dense_query_emb[s1_idx[start:end]]
+            tv = dense_target_emb[s2_idx[start:end]]
+            cos[start:end] = np.einsum("ij,ij->i", qv, tv)
+        feats["name_dense_cosine"] = cos
+    else:
+        feats["name_dense_cosine"] = np.zeros(len(pairs), dtype=np.float32)
+
+    out = pd.DataFrame({name: feats[name] for name in FEATURE_NAMES})
+    out["s1_idx"] = s1_idx
+    out["s2_s3_idx"] = s2_idx
+    out["s2_s3_id"] = [s2_s3_ids[i] for i in s2_idx]
+    return out
+
+
 FEATURE_NAMES = [
     # Name features (10)
     "name_token_sort_ratio", "name_partial_ratio", "name_WRatio",
@@ -367,4 +599,100 @@ FEATURE_NAMES = [
     # Contradiction features (4) — masterplan V §14
     "country_conflict", "addr_number_conflict", "city_conflict",
     "contradiction_count",
+    # Dense semantic feature (1) — e5 name cosine, filled at training layer
+    "name_dense_cosine",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Process-parallel feature computation (full-scale path)
+#
+# The vectorized implementation is Python-loop-bound on the set-based features
+# (jaccard/trigram/surname/conflicts), so a single process caps at ~2.5K
+# pairs/s -> ~10h for the 86M-pair full test set. Fork-based workers scale the
+# loop; the parent fills the cheap dense cosine afterwards so the big embedding
+# arrays are never pickled to workers.
+# ---------------------------------------------------------------------------
+
+_FEAT_WORKER_STATE = {}
+
+
+def _feat_worker_init(s1_names, s1_addrs, s1_countries,
+                      s2_names, s2_addrs, s2_countries, s2_ids):
+    _FEAT_WORKER_STATE.update({
+        "s1_names": s1_names, "s1_addrs": s1_addrs, "s1_countries": s1_countries,
+        "s2_names": s2_names, "s2_addrs": s2_addrs, "s2_countries": s2_countries,
+        "s2_ids": s2_ids,
+    })
+
+
+def _feat_worker_chunk(chunk_df):
+    st = _FEAT_WORKER_STATE
+    return compute_features_vectorized(
+        chunk_df,
+        st["s1_names"], st["s1_addrs"], st["s1_countries"],
+        st["s2_names"], st["s2_addrs"], st["s2_countries"], st["s2_ids"],
+        fuzzy_workers=1,  # avoid thread oversubscription across workers
+    )
+
+
+def compute_features_parallel(
+    pairs: pd.DataFrame,
+    s1_names: List[str],
+    s1_addrs: List[str],
+    s1_countries: List[str],
+    s2_s3_names: List[str],
+    s2_s3_addrs: List[str],
+    s2_s3_countries: List[str],
+    s2_s3_ids: List[str],
+    n_workers: int = None,
+    chunk_size: int = 100_000,
+    dense_query_emb=None,
+    dense_target_emb=None,
+) -> pd.DataFrame:
+    """Fork-parallel feature computation for millions of pairs.
+
+    Workers compute the lexical features (chunked, single-threaded rapidfuzz);
+    the parent computes the dense cosine with vectorized einsum afterwards.
+    """
+    import multiprocessing as mp
+
+    if len(pairs) == 0:
+        return compute_features_vectorized(
+            pairs, s1_names, s1_addrs, s1_countries,
+            s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+        )
+
+    n_workers = n_workers or max(1, (mp.cpu_count() or 4) - 1)
+    chunks = [
+        pairs.iloc[start:start + chunk_size]
+        for start in range(0, len(pairs), chunk_size)
+    ]
+
+    # Fork inherits the parent's memory (copy-on-write) — no big pickling.
+    ctx = mp.get_context("fork")
+    with ctx.Pool(
+        processes=n_workers,
+        initializer=_feat_worker_init,
+        initargs=(s1_names, s1_addrs, s1_countries,
+                  s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids),
+    ) as pool:
+        parts = pool.map(_feat_worker_chunk, chunks)
+
+    out = pd.concat(parts, ignore_index=True)
+
+    # Dense cosine in the parent (cheap einsum; workers left it at 0.0)
+    if dense_query_emb is not None and dense_target_emb is not None:
+        s1_arr = pairs["s1_idx"].to_numpy()
+        s2_arr = pairs["s2_s3_idx"].to_numpy()
+        cos = np.empty(len(pairs), dtype=np.float32)
+        step = 200_000
+        for start in range(0, len(pairs), step):
+            end = min(start + step, len(pairs))
+            cos[start:end] = np.einsum(
+                "ij,ij->i",
+                dense_query_emb[s1_arr[start:end]],
+                dense_target_emb[s2_arr[start:end]],
+            )
+        out["name_dense_cosine"] = cos
+    return out
