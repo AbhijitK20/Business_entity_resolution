@@ -1,0 +1,35 @@
+{
+  "train": {
+    "n_s1": 480,
+    "n_gallery": 2029,
+    "multi_match_pct": 88.96,
+    "singleton_pct": 5.62,
+    "mean_matches": 3.4583,
+    "max_matches": 9,
+    "blank_gallery_addr_pct": 2.76,
+    "shared_name_pct": 46.88,
+    "indic_name_pct_gallery": 9.17,
+    "total_matches": 1660,
+    "country_mix": {
+      "India": 0.4,
+      "US": 0.6
+    }
+  },
+  "test": {
+    "n_s1": 120,
+    "n_gallery": 502,
+    "multi_match_pct": 89.17,
+    "singleton_pct": 5.83,
+    "mean_matches": 3.475,
+    "max_matches": 8,
+    "blank_gallery_addr_pct": 5.18,
+    "shared_name_pct": 46.67,
+    "indic_name_pct_gallery": 9.96,
+    "total_matches": 417,
+    "country_mix": {
+      "France": 0.15,
+      "India": 0.4667,
+      "US": 0.3833
+    }
+  }
+}

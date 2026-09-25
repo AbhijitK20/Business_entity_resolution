@@ -194,7 +194,7 @@ Rules: every S1 present · no duplicates in a list · only S2/S3 IDs from the te
 | Stream | Owner | Deliverable | Can start |
 |--------|-------|-------------|-----------|
 | **A · Blocking** | **Vishwesh** | `src/normalize.py`, `src/blocking.py` + recall report | Immediately |
-| **B · Features** | **Karan** | `src/features.py` (25 features) + validation + error analysis | Immediately |
+| **B · Features** | **Karan** | `src/features.py` (35 features) + validation + error analysis | Immediately |
 | **C · Pipeline + Model** | **Abhijit** (lead) | `src/pipeline.py`, `src/model.py`, submissions | Immediately |
 | **D · Evaluation & Docs** | Shared rotation | `scripts/evaluate.py`, methodology doc, package | Hour 12+ |
 
@@ -275,8 +275,8 @@ find_best_macro_f05_threshold(y_true, y_proba, s1_ids) -> (thresh, score)
 | 13 | **Blocker similarity + bidirectional ranks discarded** — should be model features | 🔴 OPEN | Vishwesh + Abhijit |
 | 14 | **No calibration** (isotonic) before decision | 🔴 OPEN | Abhijit |
 | 15 | Address TF-IDF blocking generates too many false candidates — gate by name similarity or raise threshold | 🔴 OPEN | Vishwesh |
-| 16 | Synthetic generator uses wrong distribution (30% singleton vs real 5.6%; no cross-script) | 🟡 OPEN | Karan |
-| 17 | No candidate-oracle ceiling metric in evaluator | 🟡 OPEN | Abhijit |
+| 16 | Synthetic generator uses wrong distribution (30% singleton vs real 5.6%; no cross-script) | ✅ Fixed (PMF-calibrated K2 generator) | Karan |
+| 17 | No candidate-oracle ceiling metric in evaluator | ✅ Fixed (oracle/segments in `scripts/evaluate.py`) | Karan |
 
 ### Immediate priority (top 6)
 1. **Indic transliteration** in normalization (fixes #9) — highest measured recall impact
@@ -298,7 +298,7 @@ Amazon ML/
 │   ├── data_loader.py      # TSV loading, ground-truth parsing
 │   ├── normalize.py        # name/address normalization  [Vishwesh]
 │   ├── blocking.py         # 7-layer candidate generation [Vishwesh]
-│   ├── features.py         # 25 pairwise features        [Karan]
+│   ├── features.py         # 35 pairwise features        [Karan]
 │   ├── training.py         # pairs + hard negatives
 │   ├── model.py            # OOF stacking + thresholds
 │   └── pipeline.py         # end-to-end orchestrator     [Abhijit]

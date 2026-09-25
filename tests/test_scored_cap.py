@@ -32,11 +32,15 @@ def check(name, fn):
 def test_raw_cap_loses_true_match():
     """Demonstrates the failure mode the scored cap fixes.
 
-    A list container gives deterministic order (sets iterate hash-based).
+    The raw cap keeps the lowest candidate IDs (main made this explicit so
+    capping is reproducible across processes — candidate sets are Python sets
+    whose iteration order depends on the per-process hash seed). The true match
+    is therefore named so that it sorts LAST and gets dropped, which is the
+    whole point: an unscored budget guard discards the right answer.
     """
-    candidates = {0: [f"g{i}" for i in range(49)] + ["g-true"]}
+    candidates = {0: [f"g{i}" for i in range(49)] + ["z-true"]}
     raw = cap_candidates(candidates, max_per_query=10)
-    assert "g-true" not in raw[0], "raw cap unexpectedly kept the last candidate"
+    assert "z-true" not in raw[0], "raw cap unexpectedly kept the last candidate"
 
 
 def test_scored_cap_keeps_similar_match():
