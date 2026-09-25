@@ -125,10 +125,18 @@ def phonetic_blocking(
     query_names: List[str],
     target_names: List[str],
     target_ids: List[str],
+    max_bucket: int = 200,
+    top_k: int = 30,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using Soundex + Metaphone blocking.
-    
+
     From canonmap: phonetic and soundex blocking strategies.
+
+    Scale guards (measured need: without them this leg produced 50M candidates
+    on the 55K-entity sampled world):
+      - buckets larger than ``max_bucket`` are skipped (too generic to be
+        useful evidence — e.g. every "John Smith" shares a Soundex code)
+      - each query keeps at most ``top_k`` candidates per code
     """
     candidates = defaultdict(set)
     
@@ -150,9 +158,13 @@ def phonetic_blocking(
         mp = metaphone_key(name)
         
         if sx in target_soundex:
-            candidates[q_idx].update(target_soundex[sx])
+            bucket = target_soundex[sx]
+            if len(bucket) <= max_bucket:
+                candidates[q_idx].update(bucket[:top_k])
         if mp in target_metaphone:
-            candidates[q_idx].update(target_metaphone[mp])
+            bucket = target_metaphone[mp]
+            if len(bucket) <= max_bucket:
+                candidates[q_idx].update(bucket[:top_k])
     
     return candidates
 
@@ -161,10 +173,15 @@ def initialism_blocking(
     query_names: List[str],
     target_names: List[str],
     target_ids: List[str],
+    max_bucket: int = 100,
+    top_k: int = 20,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using initialism matching.
-    
+
     From canonmap: bidirectional initialism matching.
+
+    Scale guards: skip buckets > ``max_bucket`` (generic acronyms), keep at
+    most ``top_k`` per query.
     """
     candidates = defaultdict(set)
     
@@ -179,7 +196,9 @@ def initialism_blocking(
     for q_idx, name in enumerate(query_names):
         init = initialism_key(name)
         if init in target_initialisms:
-            candidates[q_idx].update(target_initialisms[init])
+            bucket = target_initialisms[init]
+            if len(bucket) <= max_bucket:
+                candidates[q_idx].update(bucket[:top_k])
     
     return candidates
 
@@ -212,10 +231,12 @@ def minhash_lsh_candidates(
     threshold: float = 0.4,
     num_perm: int = 128,
     shingle_size: int = 3,
+    top_k: int = 20,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using MinHash LSH.
     
     From StringMatcher: character n-gram shingles + MinHash + LSH.
+    ``top_k`` caps candidates per query (LSH buckets can be large at scale).
     """
     try:
         from datasketch import MinHash, MinHashLSH
@@ -255,7 +276,7 @@ def minhash_lsh_candidates(
     for q_idx, name in enumerate(query_names):
         mh = make_minhash(name)
         results = lsh.query(mh)
-        for r in results:
+        for r in results[:top_k]:
             t_idx = int(r.split("_")[1])
             candidates[q_idx].add(target_ids[t_idx])
     

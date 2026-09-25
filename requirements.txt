@@ -8,3 +8,5 @@ optuna>=3.0.0
 shap>=0.42.0
 jellyfish>=0.11.0
 rapidfuzz>=3.0.0
+datasketch>=1.6.0
+indic-transliteration>=2.3.0
