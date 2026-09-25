@@ -114,8 +114,7 @@ def main():
     df_frac = args.distractor_fraction if args.distractor_fraction is not None else args.fraction
 
     print(f"\n[3] Building gallery (all true matches + {df_frac:.1%} distractors)...")
-    for src, s1_name, s2_name in (("s2", "train_source2.tsv", None),
-                                  ("s3", "train_source3.tsv", None)):
+    for src in ("source2", "source3"):
         src_path = base / f"train_{src}.tsv"
         kept_rows = []
         kept_matches = 0
@@ -156,8 +155,8 @@ def main():
           f"singletons: {len(s1_rows) - n_with:,}")
 
     print(f"\nWorld written → {d}")
-    print(f"  S1={len(s1_rows):,}  S2={sum(1 for _ in open(d / 'train_s2.tsv')) - 1:,}  "
-          f"S3={sum(1 for _ in open(d / 'train_s3.tsv')) - 1:,}")
+    print(f"  S1={len(s1_rows):,}  S2={sum(1 for _ in open(d / 'train_source2.tsv')) - 1:,}  "
+          f"S3={sum(1 for _ in open(d / 'train_source3.tsv')) - 1:,}")
 
 
 if __name__ == "__main__":
