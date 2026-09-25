@@ -196,17 +196,60 @@ def construct_training_pairs(
     return pairs, train_pairs, val_pairs
 
 
+def _dense_cosines(
+    pairs: pd.DataFrame,
+    s1_df: pd.DataFrame,
+    s2_s3_df: pd.DataFrame,
+    embedding_cache: str,
+) -> np.ndarray:
+    """e5 cosine similarity for explicit (s1, candidate) pairs.
+
+    Embeddings are cached on disk (same cache as the blocking scored-cap), so
+    this is cheap after the first run. Chunked to bound memory.
+    """
+    from .dense_blocking import MULTILINGUAL_MODEL, encode_texts
+
+    q_emb = encode_texts(
+        s1_df["business_name_clean"].fillna("").tolist(),
+        model_name=MULTILINGUAL_MODEL, cache_dir=embedding_cache,
+        role="query", show_progress=False,
+    )
+    g_emb = encode_texts(
+        s2_s3_df["business_name_clean"].fillna("").tolist(),
+        model_name=MULTILINGUAL_MODEL, cache_dir=embedding_cache,
+        role="target", show_progress=False,
+    )
+    s1_pos = {e: i for i, e in enumerate(s1_df["entity_id"].tolist())}
+    s2_pos = {e: i for i, e in enumerate(s2_s3_df["entity_id"].tolist())}
+    q_idx = np.fromiter((s1_pos[x] for x in pairs["s1_entity_id"]),
+                        dtype=np.int64, count=len(pairs))
+    t_idx = np.fromiter((s2_pos[x] for x in pairs["candidate_entity_id"]),
+                        dtype=np.int64, count=len(pairs))
+
+    cos = np.empty(len(pairs), dtype=np.float32)
+    step = 200_000
+    for start in range(0, len(pairs), step):
+        end = min(start + step, len(pairs))
+        cos[start:end] = np.einsum(
+            "ij,ij->i", q_emb[q_idx[start:end]], g_emb[t_idx[start:end]]
+        )
+    return cos
+
+
 def compute_pair_features(
     pairs: pd.DataFrame,
     s1_df: pd.DataFrame,
     s2_s3_df: pd.DataFrame,
     vectorize_threshold: int = 20_000,
+    use_dense: bool = True,
+    embedding_cache: str = "local_data/embeddings",
 ) -> pd.DataFrame:
     """Compute features for all pairs.
 
     Dispatches to the vectorized implementation for large inputs (scale) and
     the row-wise one for small inputs (exact, easy to debug). Both produce the
-    same 35 features (verified by tests).
+    same 36 features (verified by tests). ``name_dense_cosine`` is computed
+    here (e5 embeddings) when ``use_dense`` is set; otherwise it stays 0.0.
     """
     from .features import (
         compute_all_features, compute_features_vectorized, FEATURE_NAMES,
@@ -235,6 +278,12 @@ def compute_pair_features(
         feats["label"] = pairs["label"].values
         feats["s1_entity_id"] = pairs["s1_entity_id"].values
         feats["candidate_entity_id"] = pairs["candidate_entity_id"].values
+        if use_dense:
+            try:
+                feats["name_dense_cosine"] = _dense_cosines(
+                    pairs, s1_df, s2_s3_df, embedding_cache)
+            except Exception as exc:  # noqa: BLE001 — never block training
+                print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
         return feats
 
     # Small path: row-wise (exact, debuggable)
@@ -273,4 +322,11 @@ def compute_pair_features(
         
         feature_rows.append(feats)
     
-    return pd.DataFrame(feature_rows)
+    out = pd.DataFrame(feature_rows)
+    if use_dense and len(out) > 0:
+        try:
+            out["name_dense_cosine"] = _dense_cosines(
+                pairs, s1_df, s2_s3_df, embedding_cache)
+        except Exception as exc:  # noqa: BLE001 — never block training
+            print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
+    return out

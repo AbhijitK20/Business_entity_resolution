@@ -112,10 +112,12 @@ class EntityResolutionPipeline:
         # Compute features
         print("Computing features for training pairs...")
         train_features = compute_pair_features(
-            train_pairs, self.train_data["train_s1"], s2_s3_train
+            train_pairs, self.train_data["train_s1"], s2_s3_train,
+            use_dense=self.use_dense_cap, embedding_cache=self.embedding_cache,
         )
         val_features = compute_pair_features(
-            val_pairs, self.train_data["train_s1"], s2_s3_train
+            val_pairs, self.train_data["train_s1"], s2_s3_train,
+            use_dense=self.use_dense_cap, embedding_cache=self.embedding_cache,
         )
         
         X_train = train_features[FEATURE_NAMES].values
@@ -339,6 +341,35 @@ class EntityResolutionPipeline:
                 pairs_df, s1_names, s1_addrs, s1_countries,
                 s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
             )
+
+        # Dense semantic cosine must match training-time features (the model
+        # was trained with real values — never leave this at the 0.0 default).
+        if self.use_dense_cap:
+            try:
+                from .dense_blocking import MULTILINGUAL_MODEL, encode_texts
+                q_emb = encode_texts(
+                    s1_names, model_name=MULTILINGUAL_MODEL,
+                    cache_dir=self.embedding_cache, role="query",
+                    show_progress=False,
+                )
+                g_emb = encode_texts(
+                    s2_s3_names, model_name=MULTILINGUAL_MODEL,
+                    cache_dir=self.embedding_cache, role="target",
+                    show_progress=False,
+                )
+                s1_arr = pairs_df["s1_idx"].to_numpy()
+                s2_arr = pairs_df["s2_s3_idx"].to_numpy()
+                cos = np.empty(len(pairs_df), dtype=np.float32)
+                step = 200_000
+                for start in range(0, len(pairs_df), step):
+                    end = min(start + step, len(pairs_df))
+                    cos[start:end] = np.einsum(
+                        "ij,ij->i",
+                        q_emb[s1_arr[start:end]], g_emb[s2_arr[start:end]],
+                    )
+                features_df["name_dense_cosine"] = cos
+            except Exception as exc:  # noqa: BLE001 — never block inference
+                print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
         
         X_test = features_df[FEATURE_NAMES].values
         

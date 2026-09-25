@@ -297,6 +297,9 @@ def compute_all_features(
     all_feats.update(cross_feats)
     all_feats.update(missing_feats)
     all_feats.update(contradiction_feats)
+    # Dense semantic similarity is computed at the training layer (embeddings
+    # live there); default to 0.0 for direct callers.
+    all_feats["name_dense_cosine"] = 0.0
     
     return all_feats
 
@@ -398,6 +401,8 @@ def compute_features_vectorized(
     s2_s3_countries: List[str],
     s2_s3_ids: List[str],
     chunk_size: int = 500_000,
+    dense_query_emb=None,
+    dense_target_emb=None,
 ) -> pd.DataFrame:
     """Vectorized pairwise features — designed for millions of pairs.
 
@@ -552,6 +557,19 @@ def compute_features_vectorized(
         phonetic_vote[k] = matches / total if total else 0.0
     feats["name_phonetic_vote"] = phonetic_vote
 
+    # --- dense semantic cosine (optional; chunked to bound memory) ---------
+    if dense_query_emb is not None and dense_target_emb is not None:
+        cos = np.empty(len(pairs), dtype=np.float32)
+        step = 200_000  # 200K x 384 x 4B x 2 arrays ~= 0.6GB temporaries
+        for start in range(0, len(pairs), step):
+            end = min(start + step, len(pairs))
+            qv = dense_query_emb[s1_idx[start:end]]
+            tv = dense_target_emb[s2_idx[start:end]]
+            cos[start:end] = np.einsum("ij,ij->i", qv, tv)
+        feats["name_dense_cosine"] = cos
+    else:
+        feats["name_dense_cosine"] = np.zeros(len(pairs), dtype=np.float32)
+
     out = pd.DataFrame({name: feats[name] for name in FEATURE_NAMES})
     out["s1_idx"] = s1_idx
     out["s2_s3_idx"] = s2_idx
@@ -580,4 +598,6 @@ FEATURE_NAMES = [
     # Contradiction features (4) — masterplan V §14
     "country_conflict", "addr_number_conflict", "city_conflict",
     "contradiction_count",
+    # Dense semantic feature (1) — e5 name cosine, filled at training layer
+    "name_dense_cosine",
 ]
