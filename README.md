@@ -62,7 +62,7 @@ python utils/validate_submission.py --matching output/matching_results.tsv \
 ## Pipeline Overview
 
 ```
-TSVs → normalize → 7-layer blocking → 25 pairwise features
+TSVs → normalize → 7-layer blocking → 35 pairwise features
      → leak-free stacking (LGB + XGB + RF → meta) → macro-F_0.5 threshold
      → matching_results.tsv + candidate_pairs.tsv
 ```
