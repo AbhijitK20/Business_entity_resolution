@@ -392,6 +392,76 @@ def cap_candidates(
     return capped
 
 
+def cap_candidates_scored(
+    candidates: Dict[int, Set[str]],
+    query_names: List[str],
+    target_names: List[str],
+    target_ids: List[str],
+    max_per_query: int = 30,
+    dense_query_emb=None,
+    dense_target_emb=None,
+    dense_weight: float = 0.5,
+    verbose: bool = False,
+) -> Dict[int, Set[str]]:
+    """Rank union candidates by similarity and keep the top-K per query.
+
+    Why: the raw first-K cap collapsed union recall from 0.941 to 0.294 on the
+    sampled world (123,709 of 191,103 matches lost) because candidates were
+    kept in arbitrary insertion order. Ranking by a real similarity signal
+    keeps the true matches in budget.
+
+    Score = (1 - dense_weight) * token_set_ratio/100
+          + dense_weight * (cosine + 1)/2      [when embeddings are provided]
+
+    Uses RapidFuzz's C implementation (``process.extract``, limit=None) so the
+    ~5.9M pairs on the sampled world score in seconds.
+    """
+    name_by_id = dict(zip(target_ids, target_names))
+    idx_by_id = {tid: i for i, tid in enumerate(target_ids)}
+    use_dense = dense_query_emb is not None and dense_target_emb is not None
+
+    capped = {}
+    n_scored = 0
+    for q_idx, cands in candidates.items():
+        if len(cands) <= max_per_query:
+            capped[q_idx] = set(cands)
+            continue
+
+        cand_list = list(cands)
+        q_name = query_names[q_idx] if q_idx < len(query_names) else ""
+
+        # Fuzzy scores. Names are already normalized/lowercased upstream —
+        # RapidFuzz scorers are case-sensitive, so never feed raw casing here.
+        # Pass plain strings (tuple choices break RapidFuzz scoring) and map
+        # the returned index back to the candidate position.
+        fuzzy = np.zeros(len(cand_list), dtype=np.float32)
+        cand_names = [name_by_id.get(t, "") for t in cand_list]
+        for _, score, pos in process.extract(
+            q_name, cand_names, scorer=fuzz.token_set_ratio, limit=None
+        ):
+            fuzzy[pos] = score / 100.0
+
+        if use_dense:
+            t_idx = np.fromiter(
+                (idx_by_id[t] for t in cand_list), dtype=np.int64,
+                count=len(cand_list),
+            )
+            sims = dense_target_emb[t_idx] @ dense_query_emb[q_idx]
+            dense01 = (sims + 1.0) / 2.0
+            score = (1.0 - dense_weight) * fuzzy + dense_weight * dense01
+        else:
+            score = fuzzy
+
+        top = np.argpartition(-score, max_per_query)[:max_per_query]
+        capped[q_idx] = {cand_list[i] for i in top}
+        n_scored += 1
+
+    if verbose:
+        print(f"  [cap_candidates_scored] scored {n_scored} queries "
+              f"(kept all for {len(capped) - n_scored})")
+    return capped
+
+
 def union_candidates(*candidate_dicts: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
     """Union multiple candidate sets."""
     union = defaultdict(set)
