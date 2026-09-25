@@ -221,6 +221,7 @@ def _dense_cosines(
     s1_df: pd.DataFrame,
     s2_s3_df: pd.DataFrame,
     embedding_cache: str,
+    model_name: str = None,
 ) -> np.ndarray:
     """e5 cosine similarity for explicit (s1, candidate) pairs.
 
@@ -229,14 +230,15 @@ def _dense_cosines(
     """
     from .dense_blocking import MULTILINGUAL_MODEL, encode_texts
 
+    model_name = model_name or MULTILINGUAL_MODEL
     q_emb = encode_texts(
         s1_df["business_name_clean"].fillna("").tolist(),
-        model_name=MULTILINGUAL_MODEL, cache_dir=embedding_cache,
+        model_name=model_name, cache_dir=embedding_cache,
         role="query", show_progress=False,
     )
     g_emb = encode_texts(
         s2_s3_df["business_name_clean"].fillna("").tolist(),
-        model_name=MULTILINGUAL_MODEL, cache_dir=embedding_cache,
+        model_name=model_name, cache_dir=embedding_cache,
         role="target", show_progress=False,
     )
     s1_pos = {e: i for i, e in enumerate(s1_df["entity_id"].tolist())}
@@ -263,6 +265,7 @@ def compute_pair_features(
     vectorize_threshold: int = 20_000,
     use_dense: bool = True,
     embedding_cache: str = "local_data/embeddings",
+    dense_model: str = None,
 ) -> pd.DataFrame:
     """Compute features for all pairs.
 
@@ -301,7 +304,7 @@ def compute_pair_features(
         if use_dense:
             try:
                 feats["name_dense_cosine"] = _dense_cosines(
-                    pairs, s1_df, s2_s3_df, embedding_cache)
+                    pairs, s1_df, s2_s3_df, embedding_cache, dense_model)
             except Exception as exc:  # noqa: BLE001 — never block training
                 print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
         return feats
@@ -346,7 +349,7 @@ def compute_pair_features(
     if use_dense and len(out) > 0:
         try:
             out["name_dense_cosine"] = _dense_cosines(
-                pairs, s1_df, s2_s3_df, embedding_cache)
+                pairs, s1_df, s2_s3_df, embedding_cache, dense_model)
         except Exception as exc:  # noqa: BLE001 — never block training
             print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
     return out

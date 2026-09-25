@@ -46,7 +46,8 @@ class EntityResolutionPipeline:
     def __init__(self, data_dir: str, output_dir: str = "output",
                  fast_mode: bool = False, max_candidates: int = 50,
                  use_dense_cap: bool = True,
-                 embedding_cache: str = "local_data/embeddings"):
+                 embedding_cache: str = "local_data/embeddings",
+                 dense_model: str = None):
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +57,10 @@ class EntityResolutionPipeline:
         self.max_candidates = max_candidates
         self.use_dense_cap = use_dense_cap
         self.embedding_cache = embedding_cache
+        if dense_model is None:
+            from .dense_blocking import MULTILINGUAL_MODEL
+            dense_model = MULTILINGUAL_MODEL
+        self.dense_model = dense_model
 
         self.train_data = None
         self.test_data = None
@@ -114,10 +119,12 @@ class EntityResolutionPipeline:
         train_features = compute_pair_features(
             train_pairs, self.train_data["train_s1"], s2_s3_train,
             use_dense=self.use_dense_cap, embedding_cache=self.embedding_cache,
+            dense_model=self.dense_model,
         )
         val_features = compute_pair_features(
             val_pairs, self.train_data["train_s1"], s2_s3_train,
             use_dense=self.use_dense_cap, embedding_cache=self.embedding_cache,
+            dense_model=self.dense_model,
         )
         
         X_train = train_features[FEATURE_NAMES].values
@@ -210,16 +217,14 @@ class EntityResolutionPipeline:
         """
         if self.use_dense_cap:
             try:
-                from .dense_blocking import (
-                    MULTILINGUAL_MODEL, encode_texts,
-                )
+                from .dense_blocking import encode_texts
                 q_emb = encode_texts(
-                    s1_names, model_name=MULTILINGUAL_MODEL,
+                    s1_names, model_name=self.dense_model,
                     cache_dir=self.embedding_cache, role="query",
                     show_progress=False,
                 )
                 g_emb = encode_texts(
-                    gallery_names, model_name=MULTILINGUAL_MODEL,
+                    gallery_names, model_name=self.dense_model,
                     cache_dir=self.embedding_cache, role="target",
                     show_progress=False,
                 )
@@ -344,14 +349,14 @@ class EntityResolutionPipeline:
 
         if self.use_dense_cap:
             try:
-                from .dense_blocking import MULTILINGUAL_MODEL, encode_texts
+                from .dense_blocking import encode_texts
                 q_emb = encode_texts(
-                    s1_names, model_name=MULTILINGUAL_MODEL,
+                    s1_names, model_name=self.dense_model,
                     cache_dir=self.embedding_cache, role="query",
                     show_progress=False,
                 )
                 g_emb = encode_texts(
-                    s2_s3_names, model_name=MULTILINGUAL_MODEL,
+                    s2_s3_names, model_name=self.dense_model,
                     cache_dir=self.embedding_cache, role="target",
                     show_progress=False,
                 )
@@ -551,6 +556,9 @@ def main():
                         help="Disable dense (e5) reranking; use fuzzy scoring")
     parser.add_argument("--embedding-cache", default="local_data/embeddings",
                         help="Directory for cached embedding arrays")
+    parser.add_argument("--dense-model", default=None,
+                        help="Encoder for dense features/reranking "
+                             "(default: intfloat/multilingual-e5-small)")
     args = parser.parse_args()
 
     pipeline = EntityResolutionPipeline(
@@ -558,6 +566,7 @@ def main():
         max_candidates=args.max_candidates,
         use_dense_cap=not args.no_dense_cap,
         embedding_cache=args.embedding_cache,
+        dense_model=args.dense_model,
     )
     pipeline.run()
 
