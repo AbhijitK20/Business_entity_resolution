@@ -103,6 +103,7 @@ def select_sets_expected_f05(
     anchor_ids: Optional[List[str]] = None,
     beta2: float = 0.25,
     p_min: float = 0.05,
+    empty_mode: str = "max_p",
 ) -> Dict[str, Set[str]]:
     """Choose a match set per S1 by maximizing expected F_0.5.
 
@@ -112,7 +113,10 @@ def select_sets_expected_f05(
       3. For k = 1..n: expected_f(k) = (1+beta2) * sum(p_1..p_k)
                                        / (beta2 * E|T| + k)
          where E|T| = sum of all owned p (expected number of true matches)
-      4. empty_score = 1 - max_p  (baseline proxy; never multiply dependent probs)
+      4. empty_score: "max_p" (baseline proxy 1 - max_p, SABER default) or
+         "product" (∏(1-p_j) over owned candidates — higher for many weak
+         candidates; note SABER warns this treats dependent edges as
+         independent, so it is an ablation, not the default)
       5. Emit the top-k prefix if it beats empty_score, else the empty set
 
     Args:
@@ -145,7 +149,11 @@ def select_sets_expected_f05(
         cum = np.cumsum(ps)
         k = np.arange(1, len(ps) + 1)
         expected_f = (1.0 + beta2) * cum / (beta2 * expected_truth + k)
-        empty_score = 1.0 - max_p
+
+        if empty_mode == "product":
+            empty_score = float(np.prod([1.0 - p for p in ps]))
+        else:  # "max_p" — SABER default
+            empty_score = 1.0 - max_p
 
         best_k = int(np.argmax(expected_f)) + 1
         if expected_f[best_k - 1] > empty_score:

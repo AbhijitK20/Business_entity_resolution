@@ -55,6 +55,7 @@ class EntityResolutionPipeline:
         self.models = None
         self.meta_model = None
         self.best_threshold = 0.5
+        self.calibrator = None
         self.test_candidates = {}
         self.test_predictions = {}
         
@@ -129,16 +130,26 @@ class EntityResolutionPipeline:
             n_trials=3 if self.fast_mode else 20,
         )
         
-        # Step 8: Optimize threshold (macro F_0.5 — matches leaderboard)
-        print("\n[8/10] Optimizing macro F_0.5 threshold...")
+        # Step 8: Calibrate + optimize threshold (macro F_0.5 — matches leaderboard)
+        print("\n[8/10] Calibrating probabilities + optimizing macro F_0.5...")
+        try:
+            from .decision import fit_isotonic
+            self.calibrator = fit_isotonic(meta_val_proba, y_val)
+            cal_val_proba = self.calibrator(meta_val_proba)
+            print("  Isotonic calibration fitted on validation predictions")
+        except Exception as exc:  # noqa: BLE001 — calibration must never block a run
+            print(f"  WARNING: calibration failed ({exc}); using raw probabilities")
+            self.calibrator = None
+            cal_val_proba = meta_val_proba
+
         val_s1_ids = val_features["s1_entity_id"].tolist()
         self.best_threshold, best_macro = find_best_macro_f05_threshold(
-            y_val, meta_val_proba, val_s1_ids
+            y_val, cal_val_proba, val_s1_ids
         )
         _, best_pair_f05 = find_best_f05_threshold(y_val, meta_val_proba)
         print(f"Best threshold: {self.best_threshold:.2f}")
-        print(f"  macro F_0.5 (val): {best_macro:.4f}")
-        print(f"  pair  F_0.5 (val): {best_pair_f05:.4f}")
+        print(f"  macro F_0.5 (val, calibrated): {best_macro:.4f}")
+        print(f"  pair  F_0.5 (val, raw):        {best_pair_f05:.4f}")
         
         # Step 9: Run inference on test
         print("\n[9/10] Running inference on test set...")
@@ -275,13 +286,19 @@ class EntityResolutionPipeline:
         X_meta = np.column_stack([lgb_proba, xgb_proba, rf_proba])
         meta_proba = self.meta_model.predict_proba(X_meta)[:, 1]
         
+        # Calibrate before the decision (isotonic fitted on validation)
+        if self.calibrator is not None:
+            decision_proba = self.calibrator(meta_proba)
+        else:
+            decision_proba = meta_proba
+        
         # --- Entity-level decision: exclusivity + expected-F0.5 --------------
         test_s1_ids = s1_df["entity_id"].tolist()
         pair_s1_ids = [test_s1_ids[i] for i in features_df["s1_idx"].tolist()]
         pair_cand_ids = features_df["s2_s3_id"].tolist()
         
         decisions = select_sets_expected_f05(
-            pair_s1_ids, pair_cand_ids, meta_proba,
+            pair_s1_ids, pair_cand_ids, decision_proba,
             anchor_ids=test_s1_ids,
         )
         self.test_predictions = {sid: sorted(matched) for sid, matched in decisions.items()}
@@ -289,8 +306,8 @@ class EntityResolutionPipeline:
         n_kept = sum(len(v) for v in self.test_predictions.values())
         n_empty = sum(1 for v in self.test_predictions.values() if not v)
         print(f"  Kept {n_kept} matches; {n_empty}/{len(test_s1_ids)} S1 predicted empty")
-        print(f"  (decision: exclusivity + expected-F0.5, threshold fallback "
-              f"{self.best_threshold:.2f})")
+        print(f"  (decision: exclusivity + expected-F0.5, calibrated="
+              f"{self.calibrator is not None})")
     
     def _generate_output(self):
         """Generate matching_results.tsv and candidate_pairs.tsv."""
