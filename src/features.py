@@ -403,6 +403,7 @@ def compute_features_vectorized(
     chunk_size: int = 500_000,
     dense_query_emb=None,
     dense_target_emb=None,
+    fuzzy_workers: int = -1,
 ) -> pd.DataFrame:
     """Vectorized pairwise features — designed for millions of pairs.
 
@@ -425,14 +426,14 @@ def compute_features_vectorized(
 
     # --- fuzzy string features (element-wise, multithreaded) ---------------
     feats: Dict[str, np.ndarray] = {}
-    feats["name_token_sort_ratio"] = rf_process.cpdist(n1, n2, scorer=fuzz.token_sort_ratio, workers=-1, dtype=np.float32) / 100.0
-    feats["name_partial_ratio"] = rf_process.cpdist(n1, n2, scorer=fuzz.partial_ratio, workers=-1, dtype=np.float32) / 100.0
-    feats["name_WRatio"] = rf_process.cpdist(n1, n2, scorer=fuzz.WRatio, workers=-1, dtype=np.float32) / 100.0
-    feats["name_jaro_winkler"] = rf_process.cpdist(n1, n2, scorer=distance.JaroWinkler.normalized_similarity, workers=-1, dtype=np.float32)
-    feats["name_edit_ratio"] = rf_process.cpdist(n1, n2, scorer=distance.Levenshtein.normalized_similarity, workers=-1, dtype=np.float32)
-    feats["addr_token_sort_ratio"] = rf_process.cpdist(a1, a2, scorer=fuzz.token_sort_ratio, workers=-1, dtype=np.float32) / 100.0
-    feats["addr_partial_ratio"] = rf_process.cpdist(a1, a2, scorer=fuzz.partial_ratio, workers=-1, dtype=np.float32) / 100.0
-    feats["addr_WRatio"] = rf_process.cpdist(a1, a2, scorer=fuzz.WRatio, workers=-1, dtype=np.float32) / 100.0
+    feats["name_token_sort_ratio"] = rf_process.cpdist(n1, n2, scorer=fuzz.token_sort_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["name_partial_ratio"] = rf_process.cpdist(n1, n2, scorer=fuzz.partial_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["name_WRatio"] = rf_process.cpdist(n1, n2, scorer=fuzz.WRatio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["name_jaro_winkler"] = rf_process.cpdist(n1, n2, scorer=distance.JaroWinkler.normalized_similarity, workers=fuzzy_workers, dtype=np.float32)
+    feats["name_edit_ratio"] = rf_process.cpdist(n1, n2, scorer=distance.Levenshtein.normalized_similarity, workers=fuzzy_workers, dtype=np.float32)
+    feats["addr_token_sort_ratio"] = rf_process.cpdist(a1, a2, scorer=fuzz.token_sort_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["addr_partial_ratio"] = rf_process.cpdist(a1, a2, scorer=fuzz.partial_ratio, workers=fuzzy_workers, dtype=np.float32) / 100.0
+    feats["addr_WRatio"] = rf_process.cpdist(a1, a2, scorer=fuzz.WRatio, workers=fuzzy_workers, dtype=np.float32) / 100.0
 
     # --- per-record precomputed sets (dedup by value) ----------------------
     s1_feat = _precompute_record_features(s1_names)
@@ -601,3 +602,97 @@ FEATURE_NAMES = [
     # Dense semantic feature (1) — e5 name cosine, filled at training layer
     "name_dense_cosine",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Process-parallel feature computation (full-scale path)
+#
+# The vectorized implementation is Python-loop-bound on the set-based features
+# (jaccard/trigram/surname/conflicts), so a single process caps at ~2.5K
+# pairs/s -> ~10h for the 86M-pair full test set. Fork-based workers scale the
+# loop; the parent fills the cheap dense cosine afterwards so the big embedding
+# arrays are never pickled to workers.
+# ---------------------------------------------------------------------------
+
+_FEAT_WORKER_STATE = {}
+
+
+def _feat_worker_init(s1_names, s1_addrs, s1_countries,
+                      s2_names, s2_addrs, s2_countries, s2_ids):
+    _FEAT_WORKER_STATE.update({
+        "s1_names": s1_names, "s1_addrs": s1_addrs, "s1_countries": s1_countries,
+        "s2_names": s2_names, "s2_addrs": s2_addrs, "s2_countries": s2_countries,
+        "s2_ids": s2_ids,
+    })
+
+
+def _feat_worker_chunk(chunk_df):
+    st = _FEAT_WORKER_STATE
+    return compute_features_vectorized(
+        chunk_df,
+        st["s1_names"], st["s1_addrs"], st["s1_countries"],
+        st["s2_names"], st["s2_addrs"], st["s2_countries"], st["s2_ids"],
+        fuzzy_workers=1,  # avoid thread oversubscription across workers
+    )
+
+
+def compute_features_parallel(
+    pairs: pd.DataFrame,
+    s1_names: List[str],
+    s1_addrs: List[str],
+    s1_countries: List[str],
+    s2_s3_names: List[str],
+    s2_s3_addrs: List[str],
+    s2_s3_countries: List[str],
+    s2_s3_ids: List[str],
+    n_workers: int = None,
+    chunk_size: int = 100_000,
+    dense_query_emb=None,
+    dense_target_emb=None,
+) -> pd.DataFrame:
+    """Fork-parallel feature computation for millions of pairs.
+
+    Workers compute the lexical features (chunked, single-threaded rapidfuzz);
+    the parent computes the dense cosine with vectorized einsum afterwards.
+    """
+    import multiprocessing as mp
+
+    if len(pairs) == 0:
+        return compute_features_vectorized(
+            pairs, s1_names, s1_addrs, s1_countries,
+            s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+        )
+
+    n_workers = n_workers or max(1, (mp.cpu_count() or 4) - 1)
+    chunks = [
+        pairs.iloc[start:start + chunk_size]
+        for start in range(0, len(pairs), chunk_size)
+    ]
+
+    # Fork inherits the parent's memory (copy-on-write) — no big pickling.
+    ctx = mp.get_context("fork")
+    with ctx.Pool(
+        processes=n_workers,
+        initializer=_feat_worker_init,
+        initargs=(s1_names, s1_addrs, s1_countries,
+                  s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids),
+    ) as pool:
+        parts = pool.map(_feat_worker_chunk, chunks)
+
+    out = pd.concat(parts, ignore_index=True)
+
+    # Dense cosine in the parent (cheap einsum; workers left it at 0.0)
+    if dense_query_emb is not None and dense_target_emb is not None:
+        s1_arr = pairs["s1_idx"].to_numpy()
+        s2_arr = pairs["s2_s3_idx"].to_numpy()
+        cos = np.empty(len(pairs), dtype=np.float32)
+        step = 200_000
+        for start in range(0, len(pairs), step):
+            end = min(start + step, len(pairs))
+            cos[start:end] = np.einsum(
+                "ij,ij->i",
+                dense_query_emb[s1_arr[start:end]],
+                dense_target_emb[s2_arr[start:end]],
+            )
+        out["name_dense_cosine"] = cos
+    return out
