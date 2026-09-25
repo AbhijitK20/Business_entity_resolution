@@ -110,3 +110,43 @@ If `main` is broken and blocking everyone:
 ## 6. Submission-Day Exception
 
 Only `output/matching_results.tsv` uploads happen on the competition portal — that's not a git push. The repo stays PR-only the whole time.
+
+---
+
+## 7. Practical Notes on Branch Protection
+
+`main` is protected with:
+- **1 approving review required** (stale reviews dismissed on new commits)
+- **`enforce_admins: true`** — even the repo owner cannot push directly or merge without approval
+- **No force pushes, no branch deletion**
+
+### Getting PRs merged
+| Situation | How to merge |
+|-----------|-------------|
+| Teammate available | They review + approve on GitHub → anyone merges |
+| Nobody available (solo work) | Owner temporarily disables `enforce_admins`, merges, re-enables (see below) |
+| Urgent hotfix | Same as above + announce in chat |
+
+### Solo merge procedure (owner only, use sparingly)
+```bash
+# 1. temporarily allow admin merge
+gh api --method DELETE repos/AbhijitK20/Business_entity_resolution/branches/main/protection/enforce_admins
+
+# 2. merge the PR
+gh pr merge <PR-number> --squash --delete-branch
+
+# 3. re-enable enforcement immediately
+cat > /tmp/enforce.json <<'EOF'
+{"enforce_admins": true}
+EOF
+gh api --method POST repos/AbhijitK20/Business_entity_resolution/branches/main/protection/enforce_admins --input /tmp/enforce.json
+```
+
+**⚠️ Step 3 is mandatory.** Never leave `enforce_admins` off.
+
+### To let teammates approve PRs
+Add them as collaborators once (need their GitHub usernames):
+```bash
+gh api --method PUT repos/AbhijitK20/Business_entity_resolution/collaborators/<username> -f permission=push
+```
+Collaborators with `push` permission can review and approve PRs but still cannot push to protected `main`.
