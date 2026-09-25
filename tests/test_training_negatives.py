@@ -100,11 +100,25 @@ def test_construct_pairs_passthrough():
     assert set(pairs["label"].unique()) == {0, 1}
 
 
+def test_entity_level_split_no_leakage():
+    """No S1 entity may appear in both train and val (pair-level splits leak,
+    inflating validation macro F_0.5)."""
+    s1, gal, gt = make_world(n_s1=120, n_gallery=3000)
+    cands = {i: set(gt[sid]) | {f"D-{i}"} for i, sid in enumerate(s1["entity_id"])}
+    pairs, tr, va = construct_training_pairs(s1, gal, gt, candidates=cands)
+    assert len(tr) > 0 and len(va) > 0
+    overlap = set(tr["s1_entity_id"]) & set(va["s1_entity_id"])
+    assert not overlap, f"entity leakage: {len(overlap)} entities in both splits"
+    # Both splits should contain positives and negatives
+    assert tr["label"].nunique() == 2 and va["label"].nunique() == 2
+
+
 if __name__ == "__main__":
     print("=== training negative-generation tests ===")
     check("candidates_used_for_hard_negatives", test_candidates_used_for_hard_negatives)
     check("no_candidates_fallback_bounded", test_no_candidates_fallback_bounded)
     check("scale_runtime", test_scale_runtime)
     check("construct_pairs_passthrough", test_construct_pairs_passthrough)
+    check("entity_level_split_no_leakage", test_entity_level_split_no_leakage)
     print(f"\n{PASSED}/{PASSED + FAILED} training tests passed.")
     sys.exit(1 if FAILED else 0)

@@ -178,20 +178,40 @@ def construct_training_pairs(
     pairs = pd.concat([positives, negatives], ignore_index=True)
     pairs = pairs.drop_duplicates(subset=["s1_entity_id", "candidate_entity_id"])
     
-    # Stratified split — guard for tiny datasets (smoke tests)
+    # Entity-level split — pairs from the same S1 must not appear on both
+    # sides. Pair-level splits leak entities (measured: val macro F_0.5 0.99
+    # vs 0.81 on a held-out entity test split).
     from sklearn.model_selection import train_test_split
-    label_counts = pairs["label"].value_counts()
-    can_stratify = (
-        len(pairs) >= 10
-        and len(label_counts) == 2
-        and label_counts.min() >= 2
-    )
-    train_pairs, val_pairs = train_test_split(
-        pairs,
-        test_size=0.2,
-        stratify=pairs["label"] if can_stratify else None,
-        random_state=random_seed,
-    )
+    s1_entities = pairs["s1_entity_id"].drop_duplicates().to_numpy()
+    if len(s1_entities) >= 10:
+        ent_has_pos = (
+            pairs.groupby("s1_entity_id")["label"].max()
+            .reindex(s1_entities).to_numpy()
+        )
+        can_stratify = 0 < ent_has_pos.sum() < len(ent_has_pos)
+        train_ids, val_ids = train_test_split(
+            s1_entities,
+            test_size=0.2,
+            stratify=ent_has_pos if can_stratify else None,
+            random_state=random_seed,
+        )
+        train_set, val_set = set(train_ids), set(val_ids)
+        train_pairs = pairs[pairs["s1_entity_id"].isin(train_set)].reset_index(drop=True)
+        val_pairs = pairs[pairs["s1_entity_id"].isin(val_set)].reset_index(drop=True)
+    else:
+        # Tiny datasets (smoke tests): keep the pair-level split
+        label_counts = pairs["label"].value_counts()
+        can_stratify = (
+            len(pairs) >= 10
+            and len(label_counts) == 2
+            and label_counts.min() >= 2
+        )
+        train_pairs, val_pairs = train_test_split(
+            pairs,
+            test_size=0.2,
+            stratify=pairs["label"] if can_stratify else None,
+            random_state=random_seed,
+        )
     
     return pairs, train_pairs, val_pairs
 
