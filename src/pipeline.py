@@ -29,7 +29,7 @@ from .blocking import (
     union_candidates, measure_blocking_quality,
     bidirectional_tfidf, key_blocking, cap_candidates,
 )
-from .features import compute_features_batch, FEATURE_NAMES
+from .features import compute_features_batch, compute_features_vectorized, FEATURE_NAMES
 from .training import (
     construct_training_pairs, compute_pair_features,
 )
@@ -271,10 +271,17 @@ class EntityResolutionPipeline:
         
         print(f"  Computing features for {len(pair_s1_idx)} candidate pairs...")
         pairs_df = pd.DataFrame({"s1_idx": pair_s1_idx, "s2_s3_idx": pair_s2_idx})
-        features_df = compute_features_batch(
-            pairs_df, s1_names, s1_addrs, s1_countries,
-            s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
-        )
+        if len(pairs_df) > 20_000:
+            print("  (vectorized path)")
+            features_df = compute_features_vectorized(
+                pairs_df, s1_names, s1_addrs, s1_countries,
+                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+            )
+        else:
+            features_df = compute_features_batch(
+                pairs_df, s1_names, s1_addrs, s1_countries,
+                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+            )
         
         X_test = features_df[FEATURE_NAMES].values
         

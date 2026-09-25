@@ -157,11 +157,44 @@ def compute_pair_features(
     pairs: pd.DataFrame,
     s1_df: pd.DataFrame,
     s2_s3_df: pd.DataFrame,
+    vectorize_threshold: int = 20_000,
 ) -> pd.DataFrame:
-    """Compute features for all pairs."""
-    from .features import compute_all_features, FEATURE_NAMES
-    
-    # Build lookup dicts
+    """Compute features for all pairs.
+
+    Dispatches to the vectorized implementation for large inputs (scale) and
+    the row-wise one for small inputs (exact, easy to debug). Both produce the
+    same 35 features (verified by tests).
+    """
+    from .features import (
+        compute_all_features, compute_features_vectorized, FEATURE_NAMES,
+    )
+
+    if len(pairs) > vectorize_threshold:
+        # Scale path: positional arrays + vectorized computation
+        s1_ids = s1_df["entity_id"].tolist()
+        s2_ids = s2_s3_df["entity_id"].tolist()
+        s1_pos = {e: i for i, e in enumerate(s1_ids)}
+        s2_pos = {e: i for i, e in enumerate(s2_ids)}
+        idx_df = pd.DataFrame({
+            "s1_idx": [s1_pos[x] for x in pairs["s1_entity_id"]],
+            "s2_s3_idx": [s2_pos[x] for x in pairs["candidate_entity_id"]],
+        })
+        feats = compute_features_vectorized(
+            idx_df,
+            s1_df["business_name_clean"].fillna("").tolist(),
+            s1_df["business_address_clean"].fillna("").tolist(),
+            s1_df["country_clean"].fillna("").tolist(),
+            s2_s3_df["business_name_clean"].fillna("").tolist(),
+            s2_s3_df["business_address_clean"].fillna("").tolist(),
+            s2_s3_df["country_clean"].fillna("").tolist(),
+            s2_ids,
+        )
+        feats["label"] = pairs["label"].values
+        feats["s1_entity_id"] = pairs["s1_entity_id"].values
+        feats["candidate_entity_id"] = pairs["candidate_entity_id"].values
+        return feats
+
+    # Small path: row-wise (exact, debuggable)
     s1_lookup = {}
     for _, row in s1_df.iterrows():
         s1_lookup[row["entity_id"]] = {
@@ -178,7 +211,6 @@ def compute_pair_features(
             "country": row.get("country_clean", ""),
         }
     
-    # Compute features
     feature_rows = []
     for _, row in pairs.iterrows():
         s1_id = row["s1_entity_id"]
