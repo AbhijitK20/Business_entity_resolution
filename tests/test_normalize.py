@@ -115,6 +115,58 @@ def test_malayalam_transliteration():
     _assert_transliterated("മലയാളം", 0x0D00, 0x0D80, "Malayalam")
 
 
+# --- candrabindu / unmapped-combining-mark regression -------------------------
+# ITRANS has no mapping for candrabindu (U+0949), Gujarati candrabindu
+# (U+0A89) or Odia nakaaraa (U+0B3C), so they used to survive into the
+# "Latin" output: hॉTel, DॉkTar, oD଼ishA. A leftover source-script character
+# breaks exact-key blocking and every trigram/MinHash key built from it, and
+# it hits the cross-script population (22.7% of India pairs) directly.
+
+_CANDRABINDU_CASES = [
+    ("Devanagari", "हॉटेल", 0x0900, 0x0980),
+    ("Devanagari", "ऑफिस", 0x0900, 0x0980),
+    ("Gujarati", "ડૉક્ટર", 0x0A80, 0x0B00),
+    ("Odia", "ଓଡ଼ିଶା", 0x0B00, 0x0B80),
+]
+
+
+def test_no_unmapped_marks_leak_into_latin_output():
+    for label, raw, lo, hi in _CANDRABINDU_CASES:
+        out = transliterate_indic(raw)
+        assert out.strip(), f"{label}: empty output for {raw!r}"
+        remaining = [c for c in out if lo <= ord(c) < hi]
+        assert not remaining, (
+            f"{label}: source-script chars leaked into output: {out!r} "
+            f"(leftover {remaining!r})"
+        )
+        assert all(ord(c) < 128 for c in out), (
+            f"{label}: non-ASCII survived in {out!r} for input {raw!r}"
+        )
+
+
+def test_latin_accented_input_is_not_stripped():
+    # The leak fix must only remove SOURCE-script characters. France is unseen
+    # in training (259k test S1 rows) and arrives with accents; folding those
+    # away here would be a silent regression. The invariant that actually
+    # matters is that accented and unaccented spellings converge on ONE key.
+    assert normalize_name("Café Zürich") == normalize_name("Cafe Zurich")
+    assert normalize_name("Société Générale") == "societe generale"
+    # legal-suffix stripping must still apply to the accented form
+    assert normalize_name("Saint-Étienne SARL") == "saint etienne"
+
+
+def test_schwa_deletion_handles_uppercase_a():
+    # ITRANS writes the same inherent vowel as uppercase A in some outputs.
+    # The rule must delete both cases, but must NOT delete long "I" (ii),
+    # which is a real vowel rather than schwa.
+    out = transliterate_indic("कृष्णा")
+    assert not out.endswith("A"), f"word-final schwa A not deleted: {out!r}"
+    # long "i" is preserved: it is a genuine vowel, not an inherent schwa
+    assert transliterate_indic("कंपनी").endswith("I"), (
+        "long 'I' must not be treated as schwa"
+    )
+
+
 def test_devanagari_canonical_ram_marketing():
     # MASTERPLAN/TASK_BREAKDOWN V1 spec: 'राम मार्केटिंग' -> 'ram marketing'
     _require_indic("canonical example")
