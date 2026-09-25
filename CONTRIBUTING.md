@@ -4,6 +4,7 @@
 **Team:** Abhijit · Vishwesh · Karan
 
 > ⚠️ **`main` is protected. Nobody pushes directly to `main` — including the lead.**
+> 🔑 **Only Abhijit merges PRs.** Everyone else: branch → commit → push → open PR → wait.
 
 ---
 
@@ -61,11 +62,11 @@ gh pr create --fill --base main
 |------|--------|
 | **Title** | Same convention as commits: `feat(blocking): ...` |
 | **Description** | What changed · evidence (measured numbers) · what to verify |
-| **Reviewers** | At least 1 teammate must approve |
+| **Reviewers** | Tag Abhijit; teammates may also review/approve |
 | **Tests** | `tests/test_smoke.py` must pass in the PR description |
 | **Evidence** | Any performance claim needs a measured number attached |
-| **Merge** | Squash-merge into `main` after approval |
-| **Delete branch** | After merge, delete the branch |
+| **Merge** | 🔑 **ONLY Abhijit merges.** Collaborators never click merge. |
+| **Delete branch** | Abhijit deletes the branch after merge (or `--delete-branch`) |
 
 ### After merge
 ```bash
@@ -102,8 +103,9 @@ git branch -d feat/<your-area>/<topic>
 
 If `main` is broken and blocking everyone:
 1. Post in chat immediately: what's broken, what you need
-2. **Do not** push a fix directly to `main` — open a PR and tag the other two for instant review
-3. If truly urgent (e.g. submission deadline), the lead may temporarily lift protection, merge, and re-enable — this must be announced in chat and re-enabled immediately
+2. **Do not** push a fix directly to `main` — open a PR and tag Abhijit
+3. **Only Abhijit merges** — he can merge the hotfix PR immediately (admin merge is enabled)
+4. Announce the fix in chat once merged
 
 ---
 
@@ -116,37 +118,45 @@ Only `output/matching_results.tsv` uploads happen on the competition portal — 
 ## 7. Practical Notes on Branch Protection
 
 `main` is protected with:
-- **1 approving review required** (stale reviews dismissed on new commits)
-- **`enforce_admins: true`** — even the repo owner cannot push directly or merge without approval
+- **1 approving review required** for non-admins (stale reviews dismissed on new commits)
+- **`enforce_admins: false`** — **Abhijit** (the only admin) can merge without waiting for an approval
 - **No force pushes, no branch deletion**
+- **Collaborators (Vishwesh, Karan) cannot push to `main`** — they must use PRs
 
-### Getting PRs merged
-| Situation | How to merge |
-|-----------|-------------|
-| Teammate available | They review + approve on GitHub → anyone merges |
-| Nobody available (solo work) | Owner temporarily disables `enforce_admins`, merges, re-enables (see below) |
-| Urgent hotfix | Same as above + announce in chat |
+### Who can do what
+| Action | Abhijit | Vishwesh / Karan | Agent (AI) |
+|--------|---------|------------------|------------|
+| Push to `feat/*` branch | ✅ | ✅ | ✅ |
+| Open PR | ✅ | ✅ | ✅ |
+| Approve a PR | ✅ | ✅ | ❌ |
+| **Merge to `main`** | ✅ **only** | ❌ | ❌ |
+| Push directly to `main` | ❌ (use PR) | ❌ | ❌ |
 
-### Solo merge procedure (owner only, use sparingly)
+### How Abhijit merges
 ```bash
-# 1. temporarily allow admin merge
-gh api --method DELETE repos/AbhijitK20/Business_entity_resolution/branches/main/protection/enforce_admins
+# list open PRs
+gh pr list
 
-# 2. merge the PR
-gh pr merge <PR-number> --squash --delete-branch
+# review the diff
+gh pr diff <number>
 
-# 3. re-enable enforcement immediately
-cat > /tmp/enforce.json <<'EOF'
-{"enforce_admins": true}
-EOF
-gh api --method POST repos/AbhijitK20/Business_entity_resolution/branches/main/protection/enforce_admins --input /tmp/enforce.json
+# merge (squash + delete branch)
+gh pr merge <number> --squash --delete-branch
 ```
 
-**⚠️ Step 3 is mandatory.** Never leave `enforce_admins` off.
+### If GitHub blocks the merge with "review required"
+That means `enforce_admins` got re-enabled. As the admin you can either:
+1. Have a teammate approve the PR, or
+2. Re-run the admin merge:
+```bash
+gh api --method DELETE repos/AbhijitK20/Business_entity_resolution/branches/main/protection/enforce_admins
+gh pr merge <number> --squash --delete-branch
+# enforce_admins stays off so you can keep merging solo
+```
 
 ### To let teammates approve PRs
 Add them as collaborators once (need their GitHub usernames):
 ```bash
 gh api --method PUT repos/AbhijitK20/Business_entity_resolution/collaborators/<username> -f permission=push
 ```
-Collaborators with `push` permission can review and approve PRs but still cannot push to protected `main`.
+Collaborators with `push` permission can review and approve PRs but **cannot push to protected `main` and must not merge**.
