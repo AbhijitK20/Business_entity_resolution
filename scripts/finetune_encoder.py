@@ -64,7 +64,7 @@ def build_training_triplets(s1, gallery, gt, rng, max_pairs=None):
             for _ in range(10):
                 if len(rows) == 0:
                     break
-                cand_id = gallery_ids[int(rng.choice(rows))]
+                cand_id = gallery_ids[int(rng.integers(0, len(rows)))]
                 if cand_id not in matched:
                     neg = g.loc[cand_id, "business_name_clean"] or ""
                     break
@@ -116,13 +116,24 @@ def main():
     ap.add_argument("--max-pairs", type=int, default=None,
                     help="cap training triplets (debug/speed)")
     ap.add_argument("--out", default="models/e5-er-ft")
+    ap.add_argument("--device", default="cuda",
+                    help="cuda (RTX 4050) or cpu; cuda falls back to cpu if unavailable")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
+    device = args.device
+    if device.startswith("cuda"):
+        import torch
+        if not torch.cuda.is_available():
+            print("WARNING: CUDA unavailable — falling back to CPU")
+            device = "cpu"
+        else:
+            props = torch.cuda.get_device_properties(0)
+            print(f"[gpu] using {props.name} ({props.total_memory/1e9:.1f} GB VRAM)")
     print("=" * 60)
-    print(f"FINE-TUNE ENCODER — base={args.base} device={get_device()}")
+    print(f"FINE-TUNE ENCODER — base={args.base} device={device}")
     print("=" * 60)
 
     data = load_training_data(args.world)
@@ -152,14 +163,14 @@ def main():
           f"val gallery={len(gallery_val):,}")
 
     t0 = time.time()
-    triplets = build_training_triplets(s1_train, gallery, gt, rng,
+    triplets = build_training_triplets(s1_train, gallery, gt, rng_np,
                                        max_pairs=args.max_pairs)
     print(f"[triplets] {len(triplets):,} built in {time.time()-t0:.1f}s")
 
     from sentence_transformers import SentenceTransformer, InputExample, losses
     from torch.utils.data import DataLoader
 
-    model = SentenceTransformer(args.base, device=get_device())
+    model = SentenceTransformer(args.base, device=device)
     train_examples = [
         InputExample(texts=[a, p, n]) for a, p, n in triplets
     ]

@@ -1,0 +1,21 @@
+{
+  "base_model": "intfloat/multilingual-e5-small",
+  "finetuned_model": "models/e5-er-ft",
+  "training": {
+    "triplets": 137414,
+    "epochs": 2,
+    "batch": 64,
+    "lr": 2e-05,
+    "loss": "MultipleNegativesRankingLoss (in-batch + same-country negatives)",
+    "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "train_time_minutes": 26
+  },
+  "eval_same_val_split": {
+    "val_s1": 4413,
+    "val_gallery": 46134,
+    "base":      {"recall@20": 0.8594, "recall@30": 0.8745},
+    "finetuned": {"recall@20": 0.9636, "recall@30": 0.9703},
+    "delta_pp":  {"recall@20": 10.42, "recall@30": 9.58}
+  },
+  "notes": "Fine-tuning on competition train pairs only (no external data). SABER fine-tuned arctic-embed-xs to 0.9964 recall@20 (US-only eval); this is the equivalent lever for the multilingual model."
+}
