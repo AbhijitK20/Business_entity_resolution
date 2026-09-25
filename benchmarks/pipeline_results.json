@@ -1,0 +1,12 @@
+{
+  "world": "tests/world_2p5_split",
+  "test_entities": 11033,
+  "runs": {
+    "v1_35_features":          {"macro_f05": 0.8033, "singleton_acc": 0.486, "matches": 45745},
+    "v2_dense_feature":        {"macro_f05": 0.8122, "singleton_acc": 0.506, "matches": 44799},
+    "v3_entity_level_split":   {"macro_f05": 0.7990, "singleton_acc": 0.462, "matches": 45970},
+    "v4_honest_validation":    {"macro_f05": 0.8716, "singleton_acc": 0.871, "matches": 28133,
+                                 "honest_val_macro_f05": 0.8479}
+  },
+  "notes": "v4: calibrator fit + validated on the full-candidate distribution of held-out entities (was pair-level, 0.99, misleading). Decision layer = exclusivity + expected-F0.5."
+}
