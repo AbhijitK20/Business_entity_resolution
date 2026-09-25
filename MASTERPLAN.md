@@ -6,6 +6,8 @@
 **Competition window:** 25–27 September 2026 (72 hours)
 **Date created:** 25 Sep 2026
 
+> **📖 Reading order:** This file (problem · data · team · timeline) → [docs/IMPLEMENTATION_BLUEPRINT.md](docs/IMPLEMENTATION_BLUEPRINT.md) (code-level spec) → [TASK_BREAKDOWN.md](TASK_BREAKDOWN.md) (task ownership) → [docs/COMPETITIVE_INTEL.md](docs/COMPETITIVE_INTEL.md) (what other teams found).
+
 ---
 
 ## 1. THE PROBLEM (one paragraph)
