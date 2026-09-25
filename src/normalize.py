@@ -5,14 +5,27 @@ import pandas as pd
 from typing import Optional
 
 
-# Legal suffixes to strip (18 patterns)
+# Legal suffixes to strip — covers US, India, UK, France, Germany forms
 LEGAL_SUFFIXES = [
+    # US
     r"\bincorporated\b", r"\binc\.?\b", r"\bcorporation\b",
-    r"\bcorp\.?\b", r"\bcompany\b", r"\bco\.?\b", r"\blimited\b",
-    r"\bltd\.?\b", r"\bllc\b", r"\bllp\b", r"\blp\b", r"\bplc\b",
-    r"\bgmbh\b", r"\bag\b", r"\bsa\b", r"\bgroup\b", r"\bholdings\b",
-    r"\benterprises?\b", r"\bassociates?\b", r"\bpartners?\b",
-    r"\bthe\b", r"\band\b", r"\blaboratory\b", r"\blab\b",
+    r"\bcorp\.?\b", r"\bcompany\b", r"\bco\.?\b",
+    r"\bllc\b", r"\bllp\b", r"\blp\b", r"\bpllc\b", r"\bpc\b",
+    # India / UK
+    r"\blimited\b", r"\bltd\.?\b", r"\bplc\b", r"\bpvt\b", r"\bprivate\b",
+    r"\bopc\b",
+    # France
+    r"\bsarl\b", r"\bsas\b", r"\bsasu\b", r"\beurl\b",
+    r"\bsnc\b", r"\bsci\b", r"\bsa\b",
+    # Germany / Europe
+    r"\bgmbh\b", r"\bag\b", r"\bkg\b", r"\bug\b",
+    r"\bbv\b", r"\bnv\b", r"\boy\b", r"\bab\b",
+    # Generic
+    r"\bgroup\b", r"\bholdings\b", r"\benterprises?\b",
+    r"\bassociates?\b", r"\bpartners?\b", r"\bthe\b", r"\band\b",
+    r"\blaboratory\b", r"\blab\b",
+    # Trade-name markers
+    r"\bdba\b", r"\btrading as\b",
 ]
 
 # Abbreviation expansion map

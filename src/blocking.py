@@ -306,33 +306,37 @@ def measure_blocking_quality(
     candidates: Dict[int, Set[str]],
     ground_truth: Dict[str, list],
     total_possible_pairs: int,
+    s1_ids: List[str] = None,
 ) -> dict:
     """Measure blocking quality metrics.
-    
+
     From armory: blocking recall = ceiling on fusion recall.
+
+    Args:
+        candidates: {s1_idx: set of candidate entity IDs}
+        ground_truth: {s1_entity_id: [matched_ids]}
+        total_possible_pairs: |S1| * |S2+S3|
+        s1_ids: list of S1 entity IDs indexed by position (required to map idx -> id)
     """
-    # Count true matches retained in candidates
     matches_retained = 0
     total_matches = 0
-    
-    for s1_id, matched_ids in ground_truth.items():
+
+    for q_idx, candidate_ids in candidates.items():
+        if s1_ids is None or q_idx >= len(s1_ids):
+            continue
+        s1_id = s1_ids[q_idx]
+        matched_ids = ground_truth.get(s1_id, [])
         total_matches += len(matched_ids)
-        # Find the query index for this s1_id
-        # (assuming candidates keys are indices, we need to map)
-        for q_idx, candidate_ids in candidates.items():
-            if s1_id in str(candidate_ids):  # Simplified check
-                for matched_id in matched_ids:
-                    if matched_id in candidate_ids:
-                        matches_retained += 1
-    
+        matches_retained += len(set(matched_ids) & set(candidate_ids))
+
     candidate_count = sum(len(v) for v in candidates.values())
     reduction_ratio = 1 - (candidate_count / max(total_possible_pairs, 1))
     pair_recall = matches_retained / max(total_matches, 1)
-    
+
     return {
         "candidate_pairs": candidate_count,
-        "reduction_ratio": reduction_ratio,
+        "reduction_ratio": round(reduction_ratio, 4),
         "matches_retained": matches_retained,
         "total_matches": total_matches,
-        "pair_recall": pair_recall,
+        "pair_recall": round(pair_recall, 4),
     }

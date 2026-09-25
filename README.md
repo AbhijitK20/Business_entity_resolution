@@ -1,56 +1,63 @@
 # Amazon ML Challenge 2026 — Business Entity Resolution
 
-## Team Members
-- [Your Name] — Lead / Pipeline Owner
-- [Member 2] — Blocking Engineer
-- [Member 3] — Feature Engineer
+**Team repo:** https://github.com/AbhijitK20/Business_entity_resolution
+**Hackathon:** 25–27 September 2026 (72 hours)
 
-## Problem
-Determine which business records from 3 independent sources describe the same real-world business, using only **name** and **address** fields.
+> **📖 Start here:** [MASTERPLAN.md](MASTERPLAN.md) — problem, data, architecture, team division, timeline, and current status.
 
-## Evaluation
-- **Metric:** F_0.5 (precision-weighted)
-- **Formula:** `F_0.5 = (1.25 × P × R) / (0.25 × P + R)`
-- **Key:** False merges cost 2× more than misses
+---
 
-## Project Structure
-```
-├── src/
-│   ├── data_loader.py      # Load TSV files
-│   ├── normalize.py        # Text normalization
-│   ├── blocking.py         # Blocking strategies
-│   ├── features.py         # Pairwise features
-│   ├── training.py         # Training data construction
-│   ├── model.py            # Model training
-│   └── pipeline.py         # Main orchestrator
-├── tests/
-├── output/
-├── models/
-├── docs/
-├── PRD.md                  # Product requirements
-├── TASK_BREAKDOWN.md       # Team task assignments
-└── requirements.txt
-```
+## Quick Links
+
+| Document | Purpose |
+|----------|---------|
+| [MASTERPLAN.md](MASTERPLAN.md) | Single source of truth for the team |
+| [PRD.md](PRD.md) | Product requirements (problem, data, output format) |
+| [TASK_BREAKDOWN.md](TASK_BREAKDOWN.md) | Detailed task assignments per member |
+| [docs/video_transcript.md](docs/video_transcript.md) | Official problem walkthrough transcript |
+| [docs/ULTIMATE_STRATEGY.md](docs/ULTIMATE_STRATEGY.md) | Strategy synthesized from 26 research repos |
 
 ## Quick Start
+
 ```bash
-# Setup environment
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+# Setup
+python3 -m venv venv && source venv/bin/activate
+uv pip install -r requirements.txt
 
-# Run pipeline
-python -m src.pipeline
+# Verify everything works (no real dataset needed — uses synthetic fixtures)
+python tests/test_smoke.py
 
-# Validate submission
-python utils/validate_submission.py \
-  --matching output/matching_results.tsv \
-  --candidate output/candidate_pairs.tsv \
-  --test-dir dataset/test
+# Generate a larger synthetic dataset for pipeline testing
+python scripts/make_synthetic_data.py --out tests/fixtures_synth --n-s1 300
+
+# Run the pipeline (fast mode)
+python -c "from src.pipeline import EntityResolutionPipeline as P; P('tests/fixtures_synth','output',fast_mode=True).run()"
+
+# Evaluate (leaderboard-style macro F_0.5)
+python scripts/evaluate.py --predictions output/matching_results.tsv \
+                           --ground-truth tests/fixtures_synth/dataset/test/test_ground_truth.tsv
+
+# Validate submission format before uploading
+python utils/validate_submission.py --matching output/matching_results.tsv \
+                                    --candidate output/candidate_pairs.tsv \
+                                    --test-dir tests/fixtures_synth/dataset/test
 ```
 
-## Timeline
-- **Hours 0-6:** Data exploration, simple baseline
-- **Hours 6-24:** Improve blocking, add features
-- **Hours 24-48:** Advanced models, optimization
-- **Hours 48-72:** Polish, documentation, final submission
+## Pipeline Overview
+
+```
+TSVs → normalize → 7-layer blocking → 25 pairwise features
+     → leak-free stacking (LGB + XGB + RF → meta) → macro-F_0.5 threshold
+     → matching_results.tsv + candidate_pairs.tsv
+```
+
+## Evaluation
+
+Macro F_0.5, precision-weighted — a false merge costs ~2× a missed match.
+**When in doubt, do not merge.**
+
+## Rules
+
+- ⚠️ **No external data**: no APIs, no geocoding, no databases — disqualification offense.
+- Model must be MIT/Apache-2.0 licensed, ≤ 8B parameters.
+- Submission must pass `utils/validate_submission.py`.

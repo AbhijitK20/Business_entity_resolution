@@ -32,9 +32,6 @@ def generate_hard_negatives(
     negatives = []
     
     for s1_id, matched_ids in ground_truth.items():
-        if not matched_ids:
-            continue
-        
         # Get S1 record
         s1_mask = s1_df["entity_id"] == s1_id
         if not s1_mask.any():
@@ -43,7 +40,7 @@ def generate_hard_negatives(
         s1_name = s1_record.get("business_name_clean", "")
         s1_country = s1_record.get("country_clean", "")
         
-        # Pool of candidates (exclude positives)
+        # Pool of candidates (exclude positives; for singletons, exclude nothing)
         positive_set = set(matched_ids)
         candidates = s2_s3_df[~s2_s3_df["entity_id"].isin(positive_set)].copy()
         
@@ -138,10 +135,19 @@ def construct_training_pairs(
     pairs = pd.concat([positives, negatives], ignore_index=True)
     pairs = pairs.drop_duplicates(subset=["s1_entity_id", "candidate_entity_id"])
     
-    # Stratified split
+    # Stratified split — guard for tiny datasets (smoke tests)
     from sklearn.model_selection import train_test_split
+    label_counts = pairs["label"].value_counts()
+    can_stratify = (
+        len(pairs) >= 10
+        and len(label_counts) == 2
+        and label_counts.min() >= 2
+    )
     train_pairs, val_pairs = train_test_split(
-        pairs, test_size=0.2, stratify=pairs["label"], random_state=random_seed
+        pairs,
+        test_size=0.2,
+        stratify=pairs["label"] if can_stratify else None,
+        random_state=random_seed,
     )
     
     return pairs, train_pairs, val_pairs

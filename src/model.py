@@ -1,19 +1,26 @@
-"""Model training module — dual-layer ensemble stacking.
+"""Model training module — dual-layer ensemble stacking with PROPER OOF.
+
+Key correctness property (leak-free stacking):
+  1. Optuna-tune each base model with inner CV on X_train.
+  2. Generate OUT-OF-FOLD predictions on X_train (each sample predicted by
+     a model that never saw it).
+  3. Train the meta-learner on OOF predictions (never on validation data).
+  4. Retrain base models on the FULL X_train for inference.
+  5. Evaluate the whole stack on X_val — which the meta-learner has never seen.
 
 Based on research from:
-- MetaBoost (dual-layer stacking)
+- MetaBoost (dual-layer stacking, shallow meta-learner)
 - imbalance-benchmark (threshold optimization)
 - ted-entity-resolution (conservative LightGBM params)
-- entity-deduplication (calibrated MLP)
 """
 import numpy as np
 import pandas as pd
 import pickle
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import lightgbm as lgb
 import xgboost as xgb
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.metrics import (
     precision_score, recall_score, f1_score,
     average_precision_score, roc_auc_score,
@@ -22,22 +29,52 @@ import optuna
 from .features import FEATURE_NAMES
 
 
-def train_base_models(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    n_trials: int = 25,
-    random_seed: int = 42,
-) -> Dict:
-    """Train 3 base models with Optuna tuning.
-    
-    Returns dict with models and their OOF predictions.
+# --------------------------------------------------------------------- utils
+def make_cv_splits(y: np.ndarray, n_splits: int = 3, random_seed: int = 42):
+    """Create CV splits that survive tiny datasets.
+
+    Preference: StratifiedKFold -> KFold -> single holdout.
     """
-    results = {}
-    
-    # === LightGBM ===
-    def lgb_objective(trial):
+    y = np.asarray(y)
+    n = len(y)
+    labels, counts = np.unique(y, return_counts=True)
+
+    if len(labels) == 2 and counts.min() >= n_splits and n >= 2 * n_splits:
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+        return list(splitter.split(np.zeros(n), y))
+
+    if n >= 2 * n_splits:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+        return list(splitter.split(np.zeros(n)))
+
+    if n >= 2:
+        cut = max(1, int(n * 0.7))
+        return [(np.arange(cut), np.arange(cut, n))]
+
+    return [(np.arange(n), np.arange(n))]
+
+
+def _safe_ap(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """average_precision_score that tolerates single-class folds."""
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+    return average_precision_score(y_true, proba)
+
+
+def _oof_predictions(model_factory, X_train, y_train, n_folds, random_seed) -> np.ndarray:
+    """Out-of-fold predictions on X_train."""
+    oof = np.zeros(len(X_train))
+    for tr_idx, va_idx in make_cv_splits(y_train, n_folds, random_seed):
+        model = model_factory()
+        model.fit(X_train[tr_idx], y_train[tr_idx])
+        if len(va_idx):
+            oof[va_idx] = model.predict_proba(X_train[va_idx])[:, 1]
+    return oof
+
+
+# ------------------------------------------------------- hyperparameter tuning
+def _tune_lightgbm(X_train, y_train, n_trials, random_seed) -> Dict:
+    def objective(trial):
         params = {
             "objective": "binary",
             "boosting_type": "gbdt",
@@ -54,54 +91,27 @@ def train_base_models(
             "verbose": -1,
             "random_state": random_seed,
         }
-        
-        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=random_seed)
         scores = []
-        for train_idx, val_idx in skf.split(X_train, y_train):
+        for tr, va in make_cv_splits(y_train, 3, random_seed):
             model = lgb.LGBMClassifier(**params)
-            model.fit(
-                X_train[train_idx], y_train[train_idx],
-                eval_set=[(X_train[val_idx], y_train[val_idx])],
-                callbacks=[lgb.early_stopping(50, verbose=False)],
-            )
-            preds = model.predict_proba(X_train[val_idx])[:, 1]
-            scores.append(average_precision_score(y_train[val_idx], preds))
-        
-        return np.mean(scores)
-    
-    print("Tuning LightGBM...")
-    lgb_study = optuna.create_study(direction="maximize", sampler=optuna.TPESampler(seed=random_seed))
-    lgb_study.optimize(lgb_objective, n_trials=n_trials, show_progress_bar=True)
-    
-    # Train final LightGBM with best params
-    lgb_params = lgb_study.best_params
-    lgb_params.update({
-        "objective": "binary",
-        "boosting_type": "gbdt",
-        "class_weight": "balanced",
-        "force_col_wise": True,
-        "verbose": -1,
-        "random_state": random_seed,
+            model.fit(X_train[tr], y_train[tr])
+            if len(va):
+                scores.append(_safe_ap(y_train[va], model.predict_proba(X_train[va])[:, 1]))
+        return float(np.mean(scores)) if scores else 0.5
+
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=random_seed))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    params = study.best_params
+    params.update({
+        "objective": "binary", "boosting_type": "gbdt", "class_weight": "balanced",
+        "force_col_wise": True, "verbose": -1, "random_state": random_seed,
     })
-    
-    lgb_model = lgb.LGBMClassifier(**lgb_params)
-    lgb_model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        callbacks=[lgb.early_stopping(50, verbose=False)],
-    )
-    lgb_val_proba = lgb_model.predict_proba(X_val)[:, 1]
-    
-    results["lgb"] = {
-        "model": lgb_model,
-        "val_proba": lgb_val_proba,
-        "best_params": lgb_params,
-        "val_auc": roc_auc_score(y_val, lgb_val_proba),
-        "val_ap": average_precision_score(y_val, lgb_val_proba),
-    }
-    
-    # === XGBoost ===
-    def xgb_objective(trial):
+    return params
+
+
+def _tune_xgboost(X_train, y_train, n_trials, random_seed) -> Dict:
+    def objective(trial):
         params = {
             "objective": "binary:logistic",
             "eval_metric": "logloss",
@@ -117,53 +127,28 @@ def train_base_models(
             "verbosity": 0,
             "random_state": random_seed,
         }
-        
-        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=random_seed)
         scores = []
-        for train_idx, val_idx in skf.split(X_train, y_train):
+        for tr, va in make_cv_splits(y_train, 3, random_seed):
             model = xgb.XGBClassifier(**params)
-            model.fit(
-                X_train[train_idx], y_train[train_idx],
-                eval_set=[(X_train[val_idx], y_train[val_idx])],
-                verbose=False,
-            )
-            preds = model.predict_proba(X_train[val_idx])[:, 1]
-            scores.append(average_precision_score(y_train[val_idx], preds))
-        
-        return np.mean(scores)
-    
-    print("Tuning XGBoost...")
-    xgb_study = optuna.create_study(direction="maximize", sampler=optuna.TPESampler(seed=random_seed))
-    xgb_study.optimize(xgb_objective, n_trials=n_trials, show_progress_bar=True)
-    
-    # Train final XGBoost
-    xgb_params = xgb_study.best_params
-    xgb_params.update({
-        "objective": "binary:logistic",
-        "eval_metric": "logloss",
-        "verbosity": 0,
+            model.fit(X_train[tr], y_train[tr])
+            if len(va):
+                scores.append(_safe_ap(y_train[va], model.predict_proba(X_train[va])[:, 1]))
+        return float(np.mean(scores)) if scores else 0.5
+
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=random_seed))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    params = study.best_params
+    params.update({
+        "objective": "binary:logistic", "eval_metric": "logloss", "verbosity": 0,
         "random_state": random_seed,
         "scale_pos_weight": len(y_train[y_train == 0]) / max(len(y_train[y_train == 1]), 1),
     })
-    
-    xgb_model = xgb.XGBClassifier(**xgb_params)
-    xgb_model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
-    )
-    xgb_val_proba = xgb_model.predict_proba(X_val)[:, 1]
-    
-    results["xgb"] = {
-        "model": xgb_model,
-        "val_proba": xgb_val_proba,
-        "best_params": xgb_params,
-        "val_auc": roc_auc_score(y_val, xgb_val_proba),
-        "val_ap": average_precision_score(y_val, xgb_val_proba),
-    }
-    
-    # === RandomForest ===
-    def rf_objective(trial):
+    return params
+
+
+def _tune_random_forest(X_train, y_train, n_trials, random_seed) -> Dict:
+    def objective(trial):
         params = {
             "n_estimators": trial.suggest_int("n_estimators", 200, 800, step=100),
             "max_depth": trial.suggest_int("max_depth", 4, 20),
@@ -173,58 +158,88 @@ def train_base_models(
             "n_jobs": -1,
             "random_state": random_seed,
         }
-        
-        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=random_seed)
         scores = []
-        for train_idx, val_idx in skf.split(X_train, y_train):
+        for tr, va in make_cv_splits(y_train, 3, random_seed):
             model = RandomForestClassifier(**params)
-            model.fit(X_train[train_idx], y_train[train_idx])
-            preds = model.predict_proba(X_train[val_idx])[:, 1]
-            scores.append(average_precision_score(y_train[val_idx], preds))
-        
-        return np.mean(scores)
-    
-    print("Tuning RandomForest...")
-    rf_study = optuna.create_study(direction="maximize", sampler=optuna.TPESampler(seed=random_seed))
-    rf_study.optimize(rf_objective, n_trials=min(n_trials, 15), show_progress_bar=True)
-    
-    # Train final RF
-    rf_params = rf_study.best_params
-    rf_params.update({
-        "class_weight": "balanced_subsample",
-        "n_jobs": -1,
-        "random_state": random_seed,
+            model.fit(X_train[tr], y_train[tr])
+            if len(va):
+                scores.append(_safe_ap(y_train[va], model.predict_proba(X_train[va])[:, 1]))
+        return float(np.mean(scores)) if scores else 0.5
+
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=random_seed))
+    study.optimize(objective, n_trials=min(n_trials, 15), show_progress_bar=False)
+    params = study.best_params
+    params.update({
+        "class_weight": "balanced_subsample", "n_jobs": -1, "random_state": random_seed,
     })
-    
-    rf_model = RandomForestClassifier(**rf_params)
-    rf_model.fit(X_train, y_train)
-    rf_val_proba = rf_model.predict_proba(X_val)[:, 1]
-    
-    results["rf"] = {
-        "model": rf_model,
-        "val_proba": rf_val_proba,
-        "best_params": rf_params,
-        "val_auc": roc_auc_score(y_val, rf_val_proba),
-        "val_ap": average_precision_score(y_val, rf_val_proba),
+    return params
+
+
+# ------------------------------------------------------------ ensemble training
+def train_base_models(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    n_trials: int = 25,
+    random_seed: int = 42,
+    n_folds: int = 5,
+) -> Dict:
+    """Tune + train 3 base models and produce OOF + validation predictions.
+
+    Returns dict: {name: {model, oof, val_proba, best_params, val_auc, val_ap}}
+    """
+    builders = {
+        "lgb": (lambda p: lgb.LGBMClassifier(**p), _tune_lightgbm),
+        "xgb": (lambda p: xgb.XGBClassifier(**p), _tune_xgboost),
+        "rf": (lambda p: RandomForestClassifier(**p), _tune_random_forest),
     }
-    
+
+    results = {}
+    for name, (factory, tuner) in builders.items():
+        print(f"Tuning {name.upper()}...")
+        params = tuner(X_train, y_train, n_trials, random_seed)
+
+        print(f"  Generating OOF predictions ({name.upper()}, {n_folds}-fold)...")
+        oof = _oof_predictions(lambda: factory(params), X_train, y_train, n_folds, random_seed)
+
+        print(f"  Fitting final {name.upper()} on full train...")
+        final_model = factory(params)
+        final_model.fit(X_train, y_train)
+        val_proba = final_model.predict_proba(X_val)[:, 1]
+
+        results[name] = {
+            "model": final_model,
+            "oof": oof,
+            "val_proba": val_proba,
+            "best_params": params,
+            "val_auc": roc_auc_score(y_val, val_proba) if len(np.unique(y_val)) > 1 else 0.5,
+            "val_ap": _safe_ap(y_val, val_proba),
+        }
+        print(f"  {name.upper()} val AP: {results[name]['val_ap']:.4f}")
+
     return results
 
 
 def train_meta_learner(
-    base_val_probas: Dict[str, np.ndarray],
+    base_results: Dict,
+    y_train: np.ndarray,
     y_val: np.ndarray,
+    n_trials: int = 20,
     random_seed: int = 42,
-) -> Tuple[object, float]:
-    """Train a shallow LightGBM meta-learner on OOF predictions.
-    
-    From MetaBoost: deliberately SHALLOW (depth 2-5, leaves 4-16).
+) -> Tuple[object, np.ndarray, np.ndarray]:
+    """Train the meta-learner on OOF predictions; evaluate on validation.
+
+    The meta-learner NEVER sees validation data during training.
+
+    Returns (meta_model, oof_meta_proba, val_meta_proba).
     """
-    # Stack base predictions
-    X_meta = np.column_stack([base_val_probas["lgb"], base_val_probas["xgb"], base_val_probas["rf"]])
-    
-    # Optuna for meta-learner
-    def meta_objective(trial):
+    base_names = ["lgb", "xgb", "rf"]
+    X_meta_train = np.column_stack([base_results[n]["oof"] for n in base_names])
+    X_meta_val = np.column_stack([base_results[n]["val_proba"] for n in base_names])
+
+    def objective(trial):
         params = {
             "objective": "binary",
             "boosting_type": "gbdt",
@@ -241,72 +256,113 @@ def train_meta_learner(
             "verbose": -1,
             "random_state": random_seed,
         }
-        
-        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=random_seed)
         scores = []
-        for train_idx, val_idx in skf.split(X_meta, y_val):
+        for tr, va in make_cv_splits(y_train, 3, random_seed):
             model = lgb.LGBMClassifier(**params)
-            model.fit(X_meta[train_idx], y_val[train_idx])
-            preds = model.predict_proba(X_meta[val_idx])[:, 1]
-            scores.append(average_precision_score(y_val[val_idx], preds))
-        
-        return np.mean(scores)
-    
+            model.fit(X_meta_train[tr], y_train[tr])
+            if len(va):
+                scores.append(_safe_ap(y_train[va], model.predict_proba(X_meta_train[va])[:, 1]))
+        return float(np.mean(scores)) if scores else 0.5
+
     print("Tuning meta-learner...")
-    meta_study = optuna.create_study(direction="maximize", sampler=optuna.TPESampler(seed=random_seed))
-    meta_study.optimize(meta_objective, n_trials=20, show_progress_bar=True)
-    
-    # Train final meta-learner
-    meta_params = meta_study.best_params
-    meta_params.update({
-        "objective": "binary",
-        "boosting_type": "gbdt",
-        "class_weight": "balanced",
-        "force_col_wise": True,
-        "verbose": -1,
-        "random_state": random_seed,
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=random_seed))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    params = study.best_params
+    params.update({
+        "objective": "binary", "boosting_type": "gbdt", "class_weight": "balanced",
+        "force_col_wise": True, "verbose": -1, "random_state": random_seed,
     })
-    
-    meta_model = lgb.LGBMClassifier(**meta_params)
-    meta_model.fit(X_meta, y_val)
-    
-    meta_val_proba = meta_model.predict_proba(X_meta)[:, 1]
-    meta_auc = roc_auc_score(y_val, meta_val_proba)
-    meta_ap = average_precision_score(y_val, meta_val_proba)
-    
-    print(f"Meta-learner AUC: {meta_auc:.4f}, AP: {meta_ap:.4f}")
-    
-    return meta_model, meta_val_proba
+
+    meta_model = lgb.LGBMClassifier(**params)
+    meta_model.fit(X_meta_train, y_train)
+
+    oof_meta_proba = meta_model.predict_proba(X_meta_train)[:, 1]
+    val_meta_proba = meta_model.predict_proba(X_meta_val)[:, 1]
+
+    print(f"  meta OOF AP : {_safe_ap(y_train, oof_meta_proba):.4f}")
+    print(f"  meta val AP : {_safe_ap(y_val, val_meta_proba):.4f}")
+
+    return meta_model, oof_meta_proba, val_meta_proba
 
 
+# ---------------------------------------------------------------- thresholds
 def find_best_f05_threshold(y_true: np.ndarray, y_proba: np.ndarray) -> Tuple[float, float]:
-    """Find threshold that maximizes F_0.5.
-    
-    F_0.5 = (1.25 * P * R) / (0.25 * P + R)
-    From imbalance-benchmark: scan in 0.01 steps.
-    """
-    best_thresh, best_f05 = 0.5, 0
-    
+    """Find threshold that maximizes pair-level F_0.5."""
+    best_thresh, best_f05 = 0.5, 0.0
     for thresh in np.arange(0.1, 0.95, 0.01):
         preds = (y_proba >= thresh).astype(int)
         p = precision_score(y_true, preds, zero_division=0)
         r = recall_score(y_true, preds, zero_division=0)
-        f05 = (1.25 * p * r) / (0.25 * p + r) if (0.25 * p + r) > 0 else 0
-        
+        f05 = (1.25 * p * r) / (0.25 * p + r) if (0.25 * p + r) > 0 else 0.0
         if f05 > best_f05:
-            best_f05 = f05
-            best_thresh = thresh
-    
+            best_f05, best_thresh = f05, thresh
     return best_thresh, best_f05
 
 
+def find_best_macro_f05_threshold(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    s1_ids: List[str],
+    step: float = 0.01,
+    lo: float = 0.05,
+    hi: float = 0.95,
+) -> Tuple[float, float]:
+    """Find the threshold that maximizes MACRO-averaged F_0.5 per S1 entity.
+
+    Mirrors the leaderboard metric: each S1 entity in the validation pair set
+    is scored individually (all-negative entities score 1.0 when predicted
+    empty, 0.0 otherwise), then scores are averaged across entities.
+    """
+    y_true = np.asarray(y_true)
+    y_proba = np.asarray(y_proba)
+
+    groups: Dict[str, List[int]] = {}
+    for i, sid in enumerate(s1_ids):
+        groups.setdefault(sid, []).append(i)
+
+    entity_data = []
+    for sid, idxs in groups.items():
+        idxs_arr = np.asarray(idxs)
+        entity_data.append((idxs_arr, y_true[idxs_arr]))
+
+    best_thresh, best_macro = 0.5, -1.0
+    for thresh in np.arange(lo, hi + 1e-9, step):
+        scores = []
+        for idxs_arr, labels in entity_data:
+            preds = (y_proba[idxs_arr] >= thresh).astype(int)
+            n_pos = int(labels.sum())
+
+            if n_pos == 0:
+                scores.append(1.0 if preds.sum() == 0 else 0.0)
+                continue
+
+            tp = int(((preds == 1) & (labels == 1)).sum())
+            fp = int(((preds == 1) & (labels == 0)).sum())
+            fn = n_pos - tp
+
+            if tp == 0:
+                scores.append(0.0)
+                continue
+
+            p = tp / (tp + fp)
+            r = tp / (tp + fn)
+            scores.append((1.25 * p * r) / (0.25 * p + r))
+
+        macro = float(np.mean(scores)) if scores else 0.0
+        if macro > best_macro:
+            best_macro = macro
+            best_thresh = float(thresh)
+
+    return best_thresh, best_macro
+
+
+# --------------------------------------------------------------------- io
 def save_model(model, path: str) -> None:
-    """Save model to pickle."""
     with open(path, "wb") as f:
         pickle.dump(model, f)
 
 
 def load_model(path: str):
-    """Load model from pickle."""
     with open(path, "rb") as f:
         return pickle.load(f)
