@@ -618,17 +618,24 @@ def measure_blocking_quality(
         ground_truth: {s1_entity_id: [matched_ids]}
         total_possible_pairs: |S1| * |S2+S3|
         s1_ids: list of S1 entity IDs indexed by position (required to map idx -> id)
+
+    Note: the denominator is ALL ground-truth matches across every S1 entity —
+    queries with zero candidates correctly count their matches as lost.
     """
     matches_retained = 0
     total_matches = 0
 
-    for q_idx, candidate_ids in candidates.items():
-        if s1_ids is None or q_idx >= len(s1_ids):
-            continue
-        s1_id = s1_ids[q_idx]
-        matched_ids = ground_truth.get(s1_id, [])
-        total_matches += len(matched_ids)
-        matches_retained += len(set(matched_ids) & set(candidate_ids))
+    if s1_ids is not None:
+        for q_idx, s1_id in enumerate(s1_ids):
+            matched_ids = ground_truth.get(s1_id, [])
+            total_matches += len(matched_ids)
+            candidate_ids = candidates.get(q_idx, set())
+            matches_retained += len(set(matched_ids) & set(candidate_ids))
+    else:
+        for q_idx, candidate_ids in candidates.items():
+            matched_ids = ground_truth.get(q_idx, [])
+            total_matches += len(matched_ids)
+            matches_retained += len(set(matched_ids) & set(candidate_ids))
 
     candidate_count = sum(len(v) for v in candidates.values())
     reduction_ratio = 1 - (candidate_count / max(total_possible_pairs, 1))

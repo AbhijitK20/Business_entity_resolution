@@ -13,9 +13,17 @@ ENV/
 
 # Data (large files - never commit)
 dataset/
-data/
+local_data/
+data_local/
+# `data` is a symlink to the dataset dir; pattern needs no trailing slash to match it
+/data
+/data/
 *.tsv
 *.csv
+*.parquet
+*.feather
+*.npy
+*.npz
 !requirements.txt
 
 # Models (binary artifacts)
@@ -24,6 +32,13 @@ models/
 *.joblib
 *.onnx
 *.h5
+*.pt
+*.safetensors
+
+# Experiment tracking
+mlruns/
+wandb/
+.ipynb_checkpoints/
 
 # Output (submission files)
 output/
@@ -57,4 +72,3 @@ Thumbs.db
 *.log
 token.json
 credentials.json
-data
