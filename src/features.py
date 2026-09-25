@@ -1,4 +1,12 @@
-"""Feature engineering module — 25 pairwise features.
+"""Feature engineering module — 35 pairwise features.
+
+Feature families:
+- name similarity (10)   — lexical + phonetic
+- address similarity (6) — lexical + trigram
+- country (1)            — exact match (open-set safe, no hard-coding)
+- cross-field (8)        — name×address evidence combinations
+- missingness (6)        — present/absent flags (masterplan V §13)
+- contradiction (4)      — explicit negative evidence (masterplan V §14)
 
 Based on research from:
 - ted-entity-resolution (17 features)
@@ -7,6 +15,7 @@ Based on research from:
 - UBS-ER (phonetic voting)
 - StringMatcher (partial_token_sort, partial_token_set)
 """
+import re
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple
@@ -185,6 +194,82 @@ def compute_cross_features(
     return features
 
 
+def compute_missingness_features(
+    name_a: str,
+    name_b: str,
+    addr_a: str,
+    addr_b: str,
+) -> Dict[str, float]:
+    """Compute 6 missingness features.
+
+    From teammate masterplan V §13: explicit present/absent flags let the model
+    distinguish "known mismatch" from "unknown", instead of similarity-on-missing
+    silently collapsing to a zero that looks like evidence.
+    """
+    name_a_p = 1.0 if (name_a and name_a.strip()) else 0.0
+    name_b_p = 1.0 if (name_b and name_b.strip()) else 0.0
+    addr_a_p = 1.0 if (addr_a and addr_a.strip()) else 0.0
+    addr_b_p = 1.0 if (addr_b and addr_b.strip()) else 0.0
+    return {
+        "name_a_present": name_a_p,
+        "name_b_present": name_b_p,
+        "addr_a_present": addr_a_p,
+        "addr_b_present": addr_b_p,
+        "both_names_present": name_a_p * name_b_p,
+        "both_addrs_present": addr_a_p * addr_b_p,
+    }
+
+
+def compute_contradiction_features(
+    name_a: str,
+    name_b: str,
+    addr_a: str,
+    addr_b: str,
+    country_a: str,
+    country_b: str,
+) -> Dict[str, float]:
+    """Compute contradiction (negative-evidence) features.
+
+    From teammate masterplans (V §14, v2 §9.1): the organizer's own example —
+    "a different business that happens to share an address" — is exactly the case
+    a similarity-only matcher over-trusts. Contradiction flags are computed only
+    when BOTH sides have a confident non-missing value (missing != contradiction).
+
+    - country_conflict:       both countries known and different
+    - addr_number_conflict:   both addresses contain digits and digit sets are disjoint
+    - city_conflict:          last tokens of both addresses differ with no containment
+    - contradiction_count:    sum of the above flags
+    """
+    country_conflict = 0.0
+    if country_a and country_b and country_a.strip() and country_b.strip():
+        country_conflict = 1.0 if country_a.strip().lower() != country_b.strip().lower() else 0.0
+
+    digit_sets = []
+    for addr in (addr_a, addr_b):
+        if addr and addr.strip():
+            digit_sets.append(set(re.findall(r"\d+", addr)))
+        else:
+            digit_sets.append(None)
+    addr_number_conflict = 0.0
+    if digit_sets[0] and digit_sets[1] and not (digit_sets[0] & digit_sets[1]):
+        addr_number_conflict = 1.0
+
+    city_conflict = 0.0
+    tokens_a = addr_a.split() if addr_a else []
+    tokens_b = addr_b.split() if addr_b else []
+    if len(tokens_a) >= 2 and len(tokens_b) >= 2:
+        city_a, city_b = tokens_a[-1], tokens_b[-1]
+        if city_a != city_b and city_a not in city_b and city_b not in city_a:
+            city_conflict = 1.0
+
+    return {
+        "country_conflict": country_conflict,
+        "addr_number_conflict": addr_number_conflict,
+        "city_conflict": city_conflict,
+        "contradiction_count": country_conflict + addr_number_conflict + city_conflict,
+    }
+
+
 def compute_all_features(
     name_a: str,
     name_b: str,
@@ -193,12 +278,16 @@ def compute_all_features(
     country_a: str,
     country_b: str,
 ) -> Dict[str, float]:
-    """Compute all 25 features for a pair."""
+    """Compute all 35 features for a pair."""
     name_feats = compute_name_features(name_a, name_b)
     addr_feats = compute_address_features(addr_a, addr_b)
     country_feats = compute_country_feature(country_a, country_b)
     cross_feats = compute_cross_features(
         name_feats, addr_feats, name_a, name_b, addr_a, addr_b
+    )
+    missing_feats = compute_missingness_features(name_a, name_b, addr_a, addr_b)
+    contradiction_feats = compute_contradiction_features(
+        name_a, name_b, addr_a, addr_b, country_a, country_b
     )
     
     all_feats = {}
@@ -206,6 +295,8 @@ def compute_all_features(
     all_feats.update(addr_feats)
     all_feats.update(country_feats)
     all_feats.update(cross_feats)
+    all_feats.update(missing_feats)
+    all_feats.update(contradiction_feats)
     
     return all_feats
 
@@ -270,4 +361,10 @@ FEATURE_NAMES = [
     "name_addr_WRatio_avg", "name_addr_WRatio_max", "name_addr_WRatio_min",
     "name_addr_jaccard_avg", "is_company", "name_phonetic_vote",
     "surname_length_diff", "combined_trigram",
+    # Missingness features (6) — masterplan V §13
+    "name_a_present", "name_b_present", "addr_a_present", "addr_b_present",
+    "both_names_present", "both_addrs_present",
+    # Contradiction features (4) — masterplan V §14
+    "country_conflict", "addr_number_conflict", "city_conflict",
+    "contradiction_count",
 ]

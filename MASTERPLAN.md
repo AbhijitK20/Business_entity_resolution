@@ -23,13 +23,42 @@ SOURCE 1 (reference)          SOURCE 2 (noisy)                    SOURCE 3 (nois
 
 ---
 
-## 2. DATA (confirmed from official video)
+## 2. DATA (confirmed from official video + independently audited by 2 other teams)
+
+### 🔴 VERIFIED SCALE (from `docs/COMPETITIVE_INTEL.md` — two teams audited the real files)
+
+| File | Rows |
+|------|-----:|
+| `train_source1.tsv` | 2,206,821 |
+| `train_source2.tsv` | 5,034,616 |
+| `train_source3.tsv` | 5,285,603 |
+| `test_source1.tsv` | 1,732,544 (France = 259,452 ≈ 15%) |
+| `test_source2.tsv` | 4,887,273 |
+| `test_source3.tsv` | 5,082,316 |
+
+**Total 24.2M records / 2.52 GB.** Test gallery = 9.97M S2/S3. Full cross-product = 17.27 trillion pairs → **blocking is the whole game.**
+
+### 🔴 VERIFIED LABELS
+
+- **7,638,365 positive pairs**
+- **Singletons = 5.58%** (123,247) — much rarer than we assumed
+- **89% of S1 roots have MULTIPLE matches** (mean 3.46, max 11) — multi-match is the dominant case
+- All-empty baseline = **0.0558**
+- **Every S2/S3 record matches AT MOST ONE S1 entity** (zero exceptions) → enables global one-to-one exclusivity
+
+### 🔴 VERIFIED NOISE
+
+- ~80% of true matches have different normalized names → fuzzy/phonetic/semantic retrieval mandatory
+- India S1–S2 pairs: **22.7% Indic-script mismatch** (Devanagari/Telugu/etc. vs Latin) → transliteration mandatory
+- 47% of S1 names are shared across businesses → name alone decides little
+- Blank addresses exist only on the candidate side (~3%); S1 addresses never blank
+- 2.68M gallery distractors in train — include in validation
 
 ### Fields (per record)
 | Column | Example | Notes |
 |--------|---------|-------|
 | `entity_id` | `S1-732914`, `S2-118820`, `S3-905477` | Prefix encodes the source |
-| `business_name` | `Acme Robotics Inc` | Noisy: abbreviations, typos, transpositions |
+| `business_name` | `Acme Robotics Inc` | Noisy: abbreviations, typos, transpositions, scripts |
 | `business_address` | `500 Market St, San Jose` | Noisy: abbreviations, landmarks, missing parts |
 | `country` | `US`, `India`, `France` | Open set — France appears **only in test** |
 
@@ -234,14 +263,28 @@ find_best_macro_f05_threshold(y_true, y_proba, s1_ids) -> (thresh, score)
 | 3 | Meta-learner was trained on validation data (leakage) — fixed with OOF stacking | ✅ Fixed | Abhijit |
 | 4 | `candidate_pairs.tsv` was writing final matches instead of blocking candidates — fixed | ✅ Fixed | Abhijit |
 | 5 | Singletons had no negatives in training — fixed (singleton hard negatives added) | ✅ Fixed | Abhijit |
-| 6 | **Address TF-IDF blocking generates too many false candidates** (342/484 on test) — needs tuning or gating by name similarity | 🔴 OPEN | Vishwesh |
-| 7 | Tiny-data CV guards added (`make_cv_splits`, `_safe_ap`) | ✅ Fixed | Abhijit |
-| 8 | Threshold optimizes to lowest bound (0.10) on synthetic — needs investigation with real data | 🟡 OPEN | Abhijit |
+| 6 | Tiny-data CV guards added (`make_cv_splits`, `_safe_ap`) | ✅ Fixed | Abhijit |
+| 7 | Missingness + contradiction features added (35 total now) | ✅ Fixed | Abhijit |
+| 8 | **Real scale is 24.2M records** — our code has dense matrices + row-wise loops | 🔴 OPEN | All |
+| 9 | **Cross-script (Indic) names are 22.7% of India pairs** — we ASCII-fold, destroying them | 🔴 OPEN | Vishwesh |
+| 10 | **No candidate caps** — need top-K per source per S1 (~20–30) + recall-vs-K curve | 🔴 OPEN | Vishwesh |
+| 11 | **No one-to-one exclusivity** — each S2/S3 matches ≤1 S1 (verified); big precision lever unused | 🔴 OPEN | Abhijit |
+| 12 | **No per-entity expected-F0.5 set selection** — plain threshold leaves score on table | 🔴 OPEN | Abhijit |
+| 13 | **Blocker similarity + bidirectional ranks discarded** — should be model features | 🔴 OPEN | Vishwesh + Abhijit |
+| 14 | **No calibration** (isotonic) before decision | 🔴 OPEN | Abhijit |
+| 15 | Address TF-IDF blocking generates too many false candidates — gate by name similarity or raise threshold | 🔴 OPEN | Vishwesh |
+| 16 | Synthetic generator uses wrong distribution (30% singleton vs real 5.6%; no cross-script) | 🟡 OPEN | Karan |
+| 17 | No candidate-oracle ceiling metric in evaluator | 🟡 OPEN | Abhijit |
 
-### Open hypothesis for #6
-Address-based blocking is high-recall but low-precision: many businesses share cities/streets.
-**Proposed fix:** require *both* a name signal AND an address signal for address-derived candidates,
-or raise the address TF-IDF threshold from 0.25 → 0.5.
+### Immediate priority (top 6)
+1. **Indic transliteration** in normalization (fixes #9) — highest measured recall impact
+2. **Candidate caps + recall-vs-K curve** (#10) — controls compute and precision
+3. **One-to-one exclusivity** (#11) — top precision lever, verified-safe
+4. **Expected-F0.5 set selection** (#12) — optimizes the actual metric
+5. **Vectorized/chunked features + Parquet** (#8) — survival at scale
+6. **Reuse blocker similarity + bidirectional ranks** (#13) — free signal
+
+Full detail: [docs/COMPETITIVE_INTEL.md](docs/COMPETITIVE_INTEL.md) and [docs/GAP_ANALYSIS.md](docs/GAP_ANALYSIS.md).
 
 ---
 

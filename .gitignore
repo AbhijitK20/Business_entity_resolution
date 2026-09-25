@@ -32,6 +32,8 @@ output/
 # Research repos (cloned separately, not part of project)
 research/
 freellmapi/
+peoples prototype/
+official/
 
 # Personal folders
 docs by me/

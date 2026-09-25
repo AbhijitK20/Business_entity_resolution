@@ -57,10 +57,19 @@ def tfidf_blocking_candidates(
     target_ids: List[str],
     threshold: float = 0.3,
     max_features: int = 10000,
+    top_k: int = None,
+    chunk_size: int = 512,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using TF-IDF cosine similarity.
-    
-    Returns {query_idx: set of target_ids}.
+
+    Scale-safe: computes similarities in query chunks using SPARSE matrices
+    (never materializes a dense n_query x n_target matrix) and optionally caps
+    each query to its top_k targets by cosine score.
+
+    Args:
+        threshold: minimum cosine similarity to keep a pair.
+        top_k: keep at most this many targets per query (None = unlimited).
+        chunk_size: number of queries processed per similarity block.
     """
     if not query_names or not target_names:
         return {}
@@ -71,22 +80,43 @@ def tfidf_blocking_candidates(
         ngram_range=(1, 2),
         max_features=max_features,
         analyzer="word",
+        dtype=np.float32,
     )
     tfidf_matrix = tfidf.fit_transform(all_names)
     
-    # Compute similarities between query and target
     query_matrix = tfidf_matrix[:len(query_names)]
     target_matrix = tfidf_matrix[len(query_names):]
+    target_matrix_t = target_matrix.T.tocsr()
     
     candidates = defaultdict(set)
+    n_queries = query_matrix.shape[0]
     
-    # Batch computation for efficiency
-    sim_matrix = cosine_similarity(query_matrix, target_matrix)
-    
-    for q_idx in range(len(query_names)):
-        for t_idx in range(len(target_names)):
-            if sim_matrix[q_idx, t_idx] >= threshold:
-                candidates[q_idx].add(target_ids[t_idx])
+    for start in range(0, n_queries, chunk_size):
+        end = min(start + chunk_size, n_queries)
+        chunk = query_matrix[start:end]
+        # Sparse cosine similarity: rows of `chunk` are L2-normalized by TfidfVectorizer,
+        # target rows are normalized too, so dot product == cosine.
+        sims = (chunk @ target_matrix_t).tocsr()
+        
+        for local_i in range(end - start):
+            row = sims.getrow(local_i)
+            if row.nnz == 0:
+                continue
+            data = row.data
+            indices = row.indices
+            # Prune below threshold
+            keep_mask = data >= threshold
+            if not keep_mask.any():
+                continue
+            vals = data[keep_mask]
+            idxs = indices[keep_mask]
+            # Top-K by score
+            if top_k is not None and len(vals) > top_k:
+                top_pos = np.argpartition(-vals, top_k)[:top_k]
+                vals, idxs = vals[top_pos], idxs[top_pos]
+            q_idx = start + local_i
+            for t_pos in idxs:
+                candidates[q_idx].add(target_ids[t_pos])
     
     return candidates
 
@@ -261,8 +291,13 @@ def address_tfidf_candidates(
     target_addrs: List[str],
     target_ids: List[str],
     threshold: float = 0.3,
+    top_k: int = None,
+    chunk_size: int = 512,
 ) -> Dict[int, Set[str]]:
-    """Generate candidates using TF-IDF on addresses."""
+    """Generate candidates using TF-IDF on addresses.
+
+    Scale-safe: chunked sparse similarity + optional top-K per query.
+    """
     # Filter out empty addresses
     valid_query = [(i, a) for i, a in enumerate(query_addrs) if a]
     valid_target = [(i, a, tid) for i, (a, tid) in enumerate(zip(target_addrs, target_ids)) if a]
@@ -276,21 +311,64 @@ def address_tfidf_candidates(
     target_ids_filtered = [v[2] for v in valid_target]
     
     all_texts = query_texts + target_texts
-    tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=5000)
+    tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=5000, dtype=np.float32)
     tfidf_matrix = tfidf.fit_transform(all_texts)
     
     query_matrix = tfidf_matrix[:len(query_texts)]
     target_matrix = tfidf_matrix[len(query_texts):]
+    target_matrix_t = target_matrix.T.tocsr()
     
     candidates = defaultdict(set)
-    sim_matrix = cosine_similarity(query_matrix, target_matrix)
+    n_queries = query_matrix.shape[0]
     
-    for q_local_idx, q_global_idx in enumerate(query_indices):
-        for t_local_idx in range(len(target_texts)):
-            if sim_matrix[q_local_idx, t_local_idx] >= threshold:
-                candidates[q_global_idx].add(target_ids_filtered[t_local_idx])
+    for start in range(0, n_queries, chunk_size):
+        end = min(start + chunk_size, n_queries)
+        chunk = query_matrix[start:end]
+        sims = (chunk @ target_matrix_t).tocsr()
+        
+        for local_i in range(end - start):
+            row = sims.getrow(local_i)
+            if row.nnz == 0:
+                continue
+            keep_mask = row.data >= threshold
+            if not keep_mask.any():
+                continue
+            vals = row.data[keep_mask]
+            idxs = row.indices[keep_mask]
+            if top_k is not None and len(vals) > top_k:
+                top_pos = np.argpartition(-vals, top_k)[:top_k]
+                vals, idxs = vals[top_pos], idxs[top_pos]
+            q_global = query_indices[start + local_i]
+            for t_pos in idxs:
+                candidates[q_global].add(target_ids_filtered[t_pos])
     
     return candidates
+
+
+def cap_candidates(
+    candidates: Dict[int, Set[str]],
+    max_per_query: int,
+    keep_fn=None,
+) -> Dict[int, Set[str]]:
+    """Cap each query's candidate set to at most max_per_query entries.
+
+    ``keep_fn(s1_idx, cand_id) -> float`` optionally scores candidates for
+    prioritization; higher scores survive. Default keeps insertion order.
+
+    Used as a final per-entity budget guard (masterplan v2 §8).
+    """
+    if max_per_query is None:
+        return candidates
+    capped = {}
+    for q_idx, cands in candidates.items():
+        if len(cands) <= max_per_query:
+            capped[q_idx] = set(cands)
+            continue
+        cand_list = list(cands)
+        if keep_fn is not None:
+            cand_list.sort(key=lambda c: keep_fn(q_idx, c), reverse=True)
+        capped[q_idx] = set(cand_list[:max_per_query])
+    return capped
 
 
 def union_candidates(*candidate_dicts: Dict[int, Set[str]]) -> Dict[int, Set[str]]:
