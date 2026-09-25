@@ -24,11 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # indic-transliteration is required by the cross-script tests but is
-          # not yet listed in requirements.txt (added in PR #6). Installing it
-          # here keeps CI honest instead of silently skipping V1 coverage.
-          pip install pytest indic-transliteration
+          pip install -r requirements.txt pytest
 
       - name: Run test suite
         run: python -m pytest tests/ -q --no-header

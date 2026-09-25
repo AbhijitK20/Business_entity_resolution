@@ -8,3 +8,10 @@ optuna>=3.0.0
 shap>=0.42.0
 jellyfish>=0.11.0
 rapidfuzz>=3.0.0
+
+# Blocking. datasketch powers the MinHash/LSH leg — a primary recall path.
+# It was imported but never declared, so a clean install silently fell back to
+# RapidFuzz and lost recall. indic-transliteration powers cross-script
+# normalization (22.7% of India pairs are cross-script).
+datasketch>=1.6
+indic-transliteration>=1.5

@@ -8,6 +8,8 @@ Based on research from:
 - armory: blocking recall = ceiling concept
 """
 import re
+import warnings
+
 import numpy as np
 import pandas as pd
 from collections import defaultdict
@@ -238,7 +240,16 @@ def minhash_lsh_candidates(
     try:
         from datasketch import MinHash, MinHashLSH
     except ImportError:
-        # Fallback: use RapidFuzz for fuzzy matching
+        # Never degrade silently. This leg is a primary recall path: a missing
+        # datasketch swaps MinHash/LSH for a RapidFuzz scan that returns
+        # different (usually far fewer) candidates, which silently lowers
+        # blocking recall instead of raising. Warn once, loudly.
+        warnings.warn(
+            "datasketch is not installed: MinHash/LSH blocking is disabled and "
+            "the RapidFuzz fallback is being used instead. This CHANGES your "
+            "candidate set and will lower blocking recall. Install 'datasketch'.",
+            RuntimeWarning,
+        )
         return _rapidfuzz_fallback_candidates(
             query_names, target_names, target_ids, threshold
         )
