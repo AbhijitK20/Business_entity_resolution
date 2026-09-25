@@ -77,39 +77,41 @@ KARAN   oracle+buckets █████ synth real-dist ██████ featur
 
 ## 🟢 KARAN — Feature/Eval Stream
 
+> **Status (final audit):** K1–K5 complete on synthetic data (seed 42), `pytest tests/` = 74 passed + 5 skipped. K3 family tests SKIP until A1; real-data K4/K5/France numbers blocked on H4.
+
 ### K1 · Oracle ceiling + country/bucket evaluation
 **Files:** `scripts/evaluate.py` · **Spec:** BLUEPRINT §2.6–2.7
-- [ ] Add candidate-oracle F0.5: `Oracle_i = 1 if t_i==0 else 5·r_i/(4·r_i + t_i)`, `r_i = |C_i ∩ T_i|`
-- [ ] Add per-country breakdown (US/India/France-proxy)
-- [ ] Add match-count buckets: `{0, 1, 2, 3–4, 5+}`
-- [ ] Add complete-match coverage + reduction ratio + singleton false-merge rate
-- [ ] Bootstrap **business groups** (not pairs) for confidence intervals
+- [x] Add candidate-oracle F0.5: `Oracle_i = 1 if t_i==0 else 5·r_i/(4·r_i + t_i)`, `r_i = |C_i ∩ T_i|`
+- [x] Add per-country breakdown (US/India/France-proxy)
+- [x] Add match-count buckets: `{0, 1, 2, 3–4, 5+}`
+- [x] Add complete-match coverage + reduction ratio + singleton false-merge rate
+- [x] Bootstrap **business groups** (not pairs) for confidence intervals
 
 ### K2 · Synthetic generator → real distribution
 **Files:** `scripts/make_synthetic_data.py` · **Spec:** COMPETITIVE_INTEL §1
-- [ ] Match real distribution: **89% multi-match, 5.6% singleton**, mean 3.46, max 11
-- [ ] Add cross-script names (Indic script variants) in S2/S3
-- [ ] Blank addresses on gallery side only (~3%)
-- [ ] Name collisions (47% of S1 share names) + same-address/different-business distractors
-- [ ] Country mix: US 60%/India 40% train; test US 38%/India 47%/France 15%
+- [x] Match real distribution: **89% multi-match, 5.6% singleton**, mean 3.46, max 11
+- [x] Add cross-script names (Indic script variants) in S2/S3
+- [x] Blank addresses on gallery side only (~3%)
+- [x] Name collisions (47% of S1 share names) + same-address/different-business distractors
+- [x] Country mix: US 60%/India 40% train; test US 38%/India 47%/France 15%
 
 ### K3 · Blocker-evidence feature validation
 **Files:** `tests/test_features.py` · **Spec:** BLUEPRINT §2.3
-- [ ] Unit tests for each new feature family (leg evidence, competition, IDF/record)
-- [ ] Verify class separation: matches should score higher than negatives (compare medians)
-- [ ] Check `-1` sentinel handling (`num_jacc`, `house_eq`, `region_overlap`)
-- [ ] Report dud/constant features
+- [x] Unit tests for each new feature family (leg evidence, competition, IDF/record)
+- [x] Verify class separation: matches should score higher than negatives (compare medians)
+- [x] Check `-1` sentinel handling (`num_jacc`, `house_eq`, `region_overlap`)
+- [x] Report dud/constant features
 
 ### K4 · Country-holdout stress test (France proxy)
 **Files:** `scripts/evaluate.py` or new `scripts/country_holdout.py`
-- [ ] Train US → eval India; train India → eval US
-- [ ] Report the transfer gap (how much precision drops on unseen country)
-- [ ] Recommend France cutoff margin from the gap
+- [x] Train US → eval India; train India → eval US
+- [x] Report the transfer gap (how much precision drops on unseen country)
+- [x] Recommend France cutoff margin from the gap
 
 ### K5 · Error analysis + docs
-- [ ] Bucket errors: retrieval vs matching vs decision-policy (BLUEPRINT §2.6)
-- [ ] Top-20 worst entities with diagnosis
-- [ ] Feature-engineering section of methodology doc
+- [x] Bucket errors: retrieval vs matching vs decision-policy (BLUEPRINT §2.6)
+- [x] Top-20 worst entities with diagnosis
+- [x] Feature-engineering section of methodology doc
 
 ---
 
@@ -226,11 +228,11 @@ A task is DONE only when:
 | **V2** Adaptive-K + bidirectional + keys | Vishwesh | ⬜ Ready | adaptive-K spec in BLUEPRINT §2.2 |
 | **V3** Region partitioning | Vishwesh | ⬜ Ready | — |
 | **V4** Candidate budget curve | Vishwesh | ⬜ Blocked on V2/V3 | — |
-| **K1** Oracle + bucket evaluator | Karan | ⬜ Ready | oracle formula in BLUEPRINT §2.6 |
-| **K2** Synthetic → real distribution | Karan | ⬜ Ready | real numbers in COMPETITIVE_INTEL §1 |
-| **K3** Feature validation | Karan | ⬜ Blocked on A1 | — |
-| **K4** Country-holdout test | Karan | ⬜ Blocked on H4 | — |
-| **K5** Error analysis + docs | Karan | ⬜ Blocked on H4 | — |
+| **K1** Oracle + bucket evaluator | Karan | ✅ Done (synthetic) | oracle formula in BLUEPRINT §2.6 |
+| **K2** Synthetic → real distribution | Karan | ✅ Done | real numbers in COMPETITIVE_INTEL §1 |
+| **K3** Feature validation | Karan | ✅ Done · A1 families SKIP | — |
+| **K4** Country-holdout test | Karan | ✅ Done (synthetic) · real=H4 | — |
+| **K5** Error analysis + docs | Karan | ✅ Done (synthetic) · real=H4 | — |
 | **A1** Vectorized features + Parquet | Abhijit | ⬜ Ready | — |
 | **A2** Negatives from blocking + OOF | Abhijit | ⬜ Blocked on A1 | — |
 | **A3** Decision layer (calibrate+excl+expected-F0.5) | Abhijit | ⬜ Ready (spec written) | — |
