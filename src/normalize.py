@@ -67,8 +67,22 @@ def _translit_run(match: "re.Match") -> str:
         )
         return text
     out = _itrans(text, script, sanscript.ITRANS)
-    # word-final schwa deletion: rama -> ram, marketinga -> marketing
-    out = re.sub(r"(?<=[^aeiouAEIOU\s])a\b", "", out)
+    # Drop source-script characters the scheme has no mapping for. ITRANS
+    # leaves candrabindu (U+0949), Gujarati candrabindu (U+0A89) and Odia
+    # nakaaraa (U+0B3C) untouched, so they survive into the "Latin" output and
+    # break exact-key blocking plus every trigram/MinHash key built from it.
+    # Only characters of the SOURCE script are removed, so Latin diacritics
+    # (Saint-Etienne, Cafe Zurich) are untouched. If stripping would leave no
+    # Latin letters at all, the transliteration did not really happen, so the
+    # original text is kept rather than emitting an empty string.
+    stripped = "".join(c for c in out if _script_of(c) != script_name)
+    if any(c.isalpha() and ord(c) < 128 for c in stripped):
+        out = stripped
+    # word-final schwa deletion: rama -> ram, marketinga -> marketing.
+    # ITRANS writes the same inherent vowel as uppercase A in some outputs
+    # (kRRiShNA -> krishna), so both cases are deleted. Long "I" (ii) is
+    # deliberately NOT stripped: it is a real vowel, not schwa.
+    out = re.sub(r"(?<=[^aeiouAEIOU\s])[aA]\b", "", out)
     # ITRANS cleanups for anusvara / conjuncts
     out = (out.replace("~N", "n").replace(".N", "n")
               .replace("M", "n").replace("JN", "gy"))
