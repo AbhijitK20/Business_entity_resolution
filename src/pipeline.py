@@ -476,7 +476,7 @@ class EntityResolutionPipeline:
             decision_proba = meta_proba
         
         # --- Entity-level decision: exclusivity + expected-F0.5 --------------
-        test_s1_ids = s1_df["entity_id"].tolist()
+        test_s1_ids = self.test_data["test_s1"]["entity_id"].tolist()
         pair_s1_ids = [test_s1_ids[i] for i in features_df["s1_idx"].tolist()]
         pair_cand_ids = features_df["s2_s3_id"].tolist()
         
