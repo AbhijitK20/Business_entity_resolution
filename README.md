@@ -24,9 +24,12 @@
 
 | Document | Purpose |
 |----------|---------|
-| [MASTERPLAN.md](MASTERPLAN.md) | Single source of truth for the team |
+| [MASTERPLAN.md](MASTERPLAN.md) | Team overview: problem, verified data, roles, timeline |
+| [docs/IMPLEMENTATION_BLUEPRINT.md](docs/IMPLEMENTATION_BLUEPRINT.md) | **Code-level spec** — exact algorithms, module specs, execution order |
+| [TASK_BREAKDOWN.md](TASK_BREAKDOWN.md) | Task ownership + live status board |
+| [docs/COMPETITIVE_INTEL.md](docs/COMPETITIVE_INTEL.md) | What 13 other teams found (verified dataset audit, SABER results) |
+| [docs/GAP_ANALYSIS.md](docs/GAP_ANALYSIS.md) | Teammate masterplans vs our implementation |
 | [PRD.md](PRD.md) | Product requirements (problem, data, output format) |
-| [TASK_BREAKDOWN.md](TASK_BREAKDOWN.md) | Detailed task assignments per member |
 | [docs/video_transcript.md](docs/video_transcript.md) | Official problem walkthrough transcript |
 | [docs/ULTIMATE_STRATEGY.md](docs/ULTIMATE_STRATEGY.md) | Strategy synthesized from 26 research repos |
 

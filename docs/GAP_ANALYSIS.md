@@ -3,6 +3,8 @@
 **Date:** 25 Sep 2026 · **Author:** Abhijit · **Status:** Action required
 
 > Deep-dive comparison of the two teammate masterplans (`team_masterplan_v.md`, `team_masterplan_v2.md`) against what we have actually built, audited against the official problem statement + guidelines.
+>
+> **➡️ Every G-item below is now converted into a code-level spec in [IMPLEMENTATION_BLUEPRINT.md](IMPLEMENTATION_BLUEPRINT.md) and a task in [TASK_BREAKDOWN.md](../TASK_BREAKDOWN.md).**
 
 ---
 

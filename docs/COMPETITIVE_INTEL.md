@@ -1,7 +1,9 @@
 # 🕵️ COMPETITIVE INTELLIGENCE — Other Teams' Repos
 
-**Date:** 25 Sep 2026 · **Sources:** 9 team repos cloned in `peoples prototype/` (gitignored)
+**Date:** 25 Sep 2026 · **Sources:** 13 team repos cloned in `peoples prototype/` (gitignored)
 **Purpose:** Extract verified facts + winning ideas. **Nothing here is copied code — it's intelligence.**
+
+> **See also:** [IMPLEMENTATION_BLUEPRINT.md](IMPLEMENTATION_BLUEPRINT.md) — converts this intel into code-level specs (exact algorithms for Indic transliteration, adaptive-K, expected-F0.5 selection, 41 features).
 
 ---
 

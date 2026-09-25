@@ -4,7 +4,7 @@
 **Event:** Amazon ML Challenge 2026 · 72-hour hackathon (25–27 Sept 2026)
 **Repo:** https://github.com/AbhijitK20/Business_entity_resolution
 
-> Read [MASTERPLAN.md](MASTERPLAN.md) first — it's the source of truth for the problem, data, architecture, and frozen interfaces.
+> **Reading order:** [MASTERPLAN.md](MASTERPLAN.md) → [docs/IMPLEMENTATION_BLUEPRINT.md](docs/IMPLEMENTATION_BLUEPRINT.md) → this file.
 
 ---
 
@@ -12,15 +12,13 @@
 
 | Member | Role | Owns | Primary files |
 |--------|------|------|---------------|
-| **Abhijit** | Lead / Pipeline & Model | Integration, ensemble training, threshold optimization, submissions, final package | `src/pipeline.py`, `src/model.py`, `src/training.py`, `src/data_loader.py` |
-| **Vishwesh** | Blocking Engineer | Normalization + candidate generation, blocking recall | `src/normalize.py`, `src/blocking.py`, `tests/test_blocking.py` |
-| **Karan** | Feature Engineer | Pairwise features, feature validation, evaluation tooling | `src/features.py`, `tests/test_features.py`, `scripts/evaluate.py` |
-
-**Shared responsibilities (rotate):** documentation, error analysis, packaging, leaderboard submissions.
+| **Abhijit** | Lead — pipeline, model, decision, submissions | Integration, vectorized features, model training, decision layer, final package | `src/pipeline.py`, `src/model.py`, `src/training.py`, `src/decision.py`, `src/data_loader.py` |
+| **Vishwesh** | Blocking engineer | Normalization + candidate generation, blocking recall | `src/normalize.py`, `src/blocking.py`, `tests/test_blocking.py`, `tests/test_normalize.py` |
+| **Karan** | Feature/eval engineer | Evaluation tooling, synthetic data, error analysis, docs | `scripts/evaluate.py`, `scripts/make_synthetic_data.py`, `tests/test_features.py`, `docs/feature_report.md` |
 
 ### File ownership rules
 - Only the owner edits their files. Others request changes via PR/issues.
-- **Frozen interfaces** (MASTERPLAN §7) may only change by team agreement.
+- **Frozen interfaces** (MASTERPLAN §7) change only by team agreement.
 - Every PR: 1 teammate approval + `python tests/test_smoke.py` passes.
 
 ---
@@ -28,208 +26,172 @@
 ## 🚀 Workstreams at a Glance
 
 ```
-        HOUR 0─6            HOUR 6─14           HOUR 14─36          HOUR 36─60          HOUR 60─72
-        ─────────────────────────────────────────────────────────────────────────────────────────
-ABHIJIT ██ setup+data ████ pipeline run ████ first submit ████████ model tuning ████ package+upload
-VISHWESH██ normalize  ████ block+recall ████ tune addr ██████████ recall push  ████ freeze+docs
-KARAN   ██ features   ████ validate    ████ eval+errors██████████ feature+   ████ docs
-                                                                  ablation
+        NOW                    HOUR +8               HOUR +16             HOUR +24              HOUR +36            HOUR +48
+        ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ABHIJIT vectorize+Parquet ██ negatives+OOF ██████ calibration+exclusivity ██████ scale benchmark ████ full run+upload ████ package
+VISHWESH Indic translit ████ adaptive-K+bidir █████ region partition ████████ budget curve ████████ tune+freeze ██████ docs
+KARAN   oracle+buckets █████ synth real-dist ██████ feature validation ██████ country-holdout ██████ error analysis ████ docs
 ```
 
 ---
 
 ## 🔵 VISHWESH — Blocking Stream
 
-### V1 · Normalization hardening *(Hours 0–4)*
-**Files:** `src/normalize.py`
-- [ ] Verify the 10-step pipeline on real dataset samples (once data lands)
-- [ ] Audit legal suffix list: US (`Inc/Corp/LLC/Co/Incorporated`), India (`Pvt/Private/Ltd/LLP`), France (`SARL/SAS/SA/EURL`), Germany (`GmbH/AG/KG`)
-- [ ] Verify abbreviation expansion (`&`→`and`, `Intl`→`international`, street abbreviations)
-- [ ] Confirm transliteration handling (accented French names → ASCII)
-- [ ] Add unit tests: `tests/test_normalize.py` with edge cases:
-  - `"Acme Corp."` → `"acme"` · `"Sanjay Textiles Pvt Ltd"` → `"sanjay textiles"` · `"Café de la Paix SARL"` → `"cafe de la paix"` · empty/NaN → `""`
+### V1 · Indic → Latin transliteration *(highest recall impact)*
+**Files:** `src/normalize.py` · **Spec:** BLUEPRINT §2.1
+- [ ] Add `indic-transliteration` dependency (`uv pip install indic-transliteration`)
+- [ ] Implement the 9-script-block transliteration (Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam) with ITRANS + word-final schwa deletion
+- [ ] Add ligature map (œ→oe, æ→ae, ß→ss, ø, ł, đ) for France
+- [ ] Keep RAW + normalized strings side by side (contradiction detection needs raw)
+- [ ] Add `is_non_latin` script flag
+- [ ] Unit tests: `राम मार्केटिंग` → `ram marketing`; `Café de la Paix SARL` → `cafe de la paix`; Latin passthrough unchanged
 
-**Done when:** `pytest tests/test_normalize.py` passes and manual samples from the real dataset look correct.
+**Evidence to record:** before/after normalization samples from real data; count of records whose normalized form changed.
 
-### V2 · Address blocking precision fix *(Hours 4–14)* 🔴 CRITICAL
-**Files:** `src/blocking.py`
-**Problem:** Address TF-IDF generates too many false candidates (342/484 on synthetic test). Many businesses share cities/streets — address alone is not strong enough evidence.
-- [ ] Add a **name-gating rule**: an address-derived candidate is kept only if the pair also has name similarity above a floor (e.g., token Jaccard ≥ 0.15 or WRatio ≥ 55)
-- [ ] Alternatively/additionally raise address TF-IDF threshold from 0.25 → 0.45–0.55 (experiment)
-- [ ] Measure candidate count reduction + recall change on train ground truth
-- [ ] Target: candidate_pairs reduced ≥ 30% with **zero recall loss**
+### V2 · Adaptive-K + bidirectional + key legs
+**Files:** `src/blocking.py` · **Spec:** BLUEPRINT §2.2
+- [ ] Implement `prune(idx, sc, kmin, kmax, gap)` — `rank < kmin OR score ≥ top1 − gap, up to kmax`
+- [ ] Defaults: forward `kmin=5, kmax=30, gap=0.10`; reverse `kmin=2, kmax=5, gap=0.05`
+- [ ] Run every leg **both directions** (S1→gallery forward, gallery→S1 reverse)
+- [ ] Key legs: address key (exact normalized ≥12 chars), name key (core name + last 2 addr tokens; drop buckets >30)
+- [ ] Measure per-leg marginal recall (which legs actually add pairs)
 
-**Done when:** `measure_blocking_quality` shows pair_recall ≥ 0.95 and candidates reduced ≥ 30% vs current.
+**Evidence to record:** per-leg contribution table; union recall with/without reverse legs.
 
-### V3 · Blocking recall push *(Hours 14–36)*
-**Files:** `src/blocking.py`
-- [ ] Run full blocking quality report on train data; list every missed true match
-- [ ] For each missed match, identify why (typo? transliteration? landmark-only address? dropped token?) and add a bridging layer
-- [ ] Tune per-layer thresholds (name TF-IDF 0.25, LSH 0.3, etc.) against ground truth
-- [ ] Keep a blocking report: `docs/blocking_report.md` — per-layer recall/contribution table
-- [ ] Add `tests/test_blocking.py` covering all 5 candidate generators + union + quality measurement
+### V3 · Region partitioning (multi-membership)
+**Files:** `src/blocking.py` · **Spec:** BLUEPRINT §2.2
+- [ ] Vocabulary: normalized comma-parts appearing in ≥0.05% of that country's S1 records (unsupervised → works for France)
+- [ ] Multi-membership: part, first/last token, first/last two tokens
+- [ ] Compare if regions intersect OR either unknown (unknown → whole country)
+- [ ] **Dead end to avoid:** one-region-per-record (last address part) loses ~4% of pairs, 92% in India
 
-**Done when:** blocking pair_recall ≥ 0.97 on train with documented per-layer contribution.
+**Evidence to record:** % of pairs retained vs % of comparisons, per country.
 
-### V4 · Freeze + docs *(Hours 60–72)*
-- [ ] Freeze `normalize.py` / `blocking.py` (no more edits)
-- [ ] Write blocking section of the methodology document (what layers, thresholds, recall achieved)
+### V4 · Candidate budget curve + freeze
+**Files:** `src/blocking.py` · **Spec:** BLUEPRINT §2.2
+- [ ] Sweep K (candidates/S1/source): 10/20/30/50 + uncapped; measure pair recall at each
+- [ ] Pick the smallest K that doesn't sacrifice recall (target ≥99% @ ~20–30)
+- [ ] Freeze blocking; write blocking section of methodology doc
 
 ---
 
-## 🟢 KARAN — Features Stream
+## 🟢 KARAN — Feature/Eval Stream
 
-### K1 · Feature validation on real data *(Hours 0–6)*
-**Files:** `src/features.py`, `tests/test_features.py`
-- [ ] Once data lands: compute all 25 features for sample pairs
-- [ ] Check for constant columns, NaNs, inf, or broken ranges on real names/addresses
-- [ ] Verify each feature discriminates: true-match pairs should score higher than negative pairs
-- [ ] Report: feature distribution table + any dud features
+### K1 · Oracle ceiling + country/bucket evaluation
+**Files:** `scripts/evaluate.py` · **Spec:** BLUEPRINT §2.6–2.7
+- [ ] Add candidate-oracle F0.5: `Oracle_i = 1 if t_i==0 else 5·r_i/(4·r_i + t_i)`, `r_i = |C_i ∩ T_i|`
+- [ ] Add per-country breakdown (US/India/France-proxy)
+- [ ] Add match-count buckets: `{0, 1, 2, 3–4, 5+}`
+- [ ] Add complete-match coverage + reduction ratio + singleton false-merge rate
+- [ ] Bootstrap **business groups** (not pairs) for confidence intervals
 
-**Done when:** feature report delivered (`docs/feature_report.md`), zero NaNs on real data.
+### K2 · Synthetic generator → real distribution
+**Files:** `scripts/make_synthetic_data.py` · **Spec:** COMPETITIVE_INTEL §1
+- [ ] Match real distribution: **89% multi-match, 5.6% singleton**, mean 3.46, max 11
+- [ ] Add cross-script names (Indic script variants) in S2/S3
+- [ ] Blank addresses on gallery side only (~3%)
+- [ ] Name collisions (47% of S1 share names) + same-address/different-business distractors
+- [ ] Country mix: US 60%/India 40% train; test US 38%/India 47%/France 15%
 
-### K2 · Feature unit tests *(Hours 6–12)*
-**Files:** `tests/test_features.py`
-- [ ] Test each feature function with known inputs:
-  - `compute_name_features("acme robotics", "acme robotics")` → all name features = 1.0
-  - identical addresses → addr features = 1.0
-  - different countries → `same_country` = 0.0
-  - empty strings → no crash, features = 0.0
-- [ ] Test `compute_all_features` returns exactly 25 keys matching `FEATURE_NAMES`
+### K3 · Blocker-evidence feature validation
+**Files:** `tests/test_features.py` · **Spec:** BLUEPRINT §2.3
+- [ ] Unit tests for each new feature family (leg evidence, competition, IDF/record)
+- [ ] Verify class separation: matches should score higher than negatives (compare medians)
+- [ ] Check `-1` sentinel handling (`num_jacc`, `house_eq`, `region_overlap`)
+- [ ] Report dud/constant features
 
-**Done when:** `pytest tests/test_features.py` passes.
+### K4 · Country-holdout stress test (France proxy)
+**Files:** `scripts/evaluate.py` or new `scripts/country_holdout.py`
+- [ ] Train US → eval India; train India → eval US
+- [ ] Report the transfer gap (how much precision drops on unseen country)
+- [ ] Recommend France cutoff margin from the gap
 
-### K3 · Error analysis + evaluation tooling *(Hours 12–36)*
-**Files:** `scripts/evaluate.py`, `docs/error_analysis.md`
-- [ ] After Abhijit's first submission: compute macro F_0.5 locally
-- [ ] Segment errors: false merges vs misses; by country (US/India/France); by singleton vs multi-match
-- [ ] Recommend the #1 fix per error category (features? threshold? blocking?)
-- [ ] Extend `evaluate.py` if needed: per-country breakdown, confusion examples
-
-**Done when:** error analysis doc lists top 10 worst entities with diagnosis.
-
-### K4 · Feature improvement *(Hours 36–60)*
-**Files:** `src/features.py`
-- [ ] Propose and test up to 5 new features based on error analysis. Candidate ideas:
-  - token-level overlap on **surnames only** (for business names ending in distinctive words)
-  - **number/city consistency** features (street number match, city match)
-  - **country-specific** address token matches (PIN code digits for India, ZIP for US)
-  - **acronym ↔ expansion** feature (IBM ↔ International Business Machines)
-- [ ] Run ablation: add one feature at a time, measure val macro F_0.5 delta
-- [ ] Only keep features with positive delta; keep `FEATURE_NAMES` in sync (frozen interface!)
-
-**Done when:** ablation table in `docs/feature_report.md` with per-feature delta.
-
-### K5 · Docs *(Hours 60–72)*
-- [ ] Write feature engineering section of the methodology document
-- [ ] Include: feature list, rationale, importance rankings (SHAP if time)
+### K5 · Error analysis + docs
+- [ ] Bucket errors: retrieval vs matching vs decision-policy (BLUEPRINT §2.6)
+- [ ] Top-20 worst entities with diagnosis
+- [ ] Feature-engineering section of methodology doc
 
 ---
 
 ## 🟡 ABHIJIT — Pipeline & Model Stream
 
-### A1 · Repo + env + data intake *(Hours 0–2)*
-**Files:** repo root
-- [x] Repo created, structure in place, all modules built
-- [x] venv + dependencies installed
-- [ ] **Download dataset from competition portal** → `data/dataset/{train,test}/`
-- [ ] Run `python -c` profile: record counts S1/S2/S3, field completeness, country distribution, match distribution
-- [ ] Save profile output to `docs/data_profile.md`
+### A1 · Vectorized features + Parquet
+**Files:** `src/features.py`, `src/pipeline.py` · **Spec:** BLUEPRINT §2.5
+- [ ] Replace row-wise loop with `rapidfuzz.process.cpdist(workers=-1)` batch computation
+- [ ] Chunk pairs ≤4M; `del + gc.collect()` after each chunk
+- [ ] Store intermediates as Parquet; stream final TSV writers
+- [ ] Never materialize >2 GB; never dense (query × gallery)
 
-**Done when:** all 7 TSVs present and profiled.
+### A2 · Negatives from blocking candidates + OOF
+**Files:** `src/training.py` · **Spec:** BLUEPRINT §2.4
+- [ ] Sample training negatives **from the actual blocking candidates** (train = inference distribution)
+- [ ] Hard negatives: same-name/different-address, same-address/different-name, unit differences
+- [ ] Sample by S1 root first (avoid many-candidate entities dominating)
+- [ ] Keep all known positives; exclude all of an anchor's positives from its negatives
+- [ ] OOF training to keep the holdout clean
 
-### A2 · First end-to-end pipeline run *(Hours 2–10)*
-**Files:** `src/pipeline.py`, `src/model.py`
-- [x] Pipeline built and smoke-tested on synthetic fixtures
-- [ ] Run full pipeline on real train data (normal mode, 25 Optuna trials)
-- [ ] Inspect: blocking metrics, training pair counts, model AP scores, threshold choice
-- [ ] Sanity-check `matching_results.tsv` + `candidate_pairs.tsv` on test
-- [ ] `validate_submission.py` must PASS
+### A3 · Decision layer: calibration + exclusivity + expected-F0.5
+**Files:** `src/decision.py` (new) · **Spec:** BLUEPRINT §2.4
+- [ ] Isotonic calibration on a held-out calibration fold
+- [ ] One-to-one exclusivity: highest-p S1 owns each candidate (tie-break s1_id asc), `p ≥ 0.05`
+- [ ] Expected-F0.5 prefix selection: `expected_f(k) = 1.25·Σp / (0.25·E|T| + k)`; empty score `1 − max_p`
+- [ ] Never multiply dependent edge probabilities
+- [ ] Emit empty set when it wins
 
-**Done when:** two output files generated on real data and validated.
+**Evidence:** measured macro F0.5 vs plain-threshold baseline (expect +0.001–0.002).
 
-### A3 · First leaderboard submission *(Hours 10–14)*
-- [ ] Upload `matching_results.tsv` to portal
-- [ ] Record the score + run number in `docs/leaderboard_log.md`
-- [ ] This is our baseline — every improvement is measured against it
+### A4 · Scale benchmark + full run
+- [ ] Smoke test on 2–5K roots → benchmark on ~50K representative roots (all countries, missing-address cases, long records)
+- [ ] Measure: ingestion rows/s, blocking time, candidates/S1, features/s, peak RAM, export time
+- [ ] Project full-run time from measured rates (no guesses)
+- [ ] Run full train → full test inference
 
-**Done when:** score visible on leaderboard.
+### A5 · Validate + upload
+- [ ] `python utils/validate_submission.py --matching ... --candidate ... --test-dir ... --check-ids` → PASS
+- [ ] Upload `matching_results.tsv` (max 5/day — log every submission with score + file hash in `docs/leaderboard_log.md`)
+- [ ] Compare public score vs local holdout → investigate any gap (likely France)
 
-### A4 · Model tuning round *(Hours 14–36)*
-**Files:** `src/model.py`
-- [ ] Increase Optuna trials (25 → 50) for base models if time allows
-- [ ] Try meta-learner variants: shallow LGB (current) vs logistic regression vs weighted average
-- [ ] Calibrate probabilities (isotonic) before thresholding — check if it helps macro F_0.5
-- [ ] Compare ensemble vs single LightGBM (ensemble may not always win)
-- [ ] Log every experiment in `docs/experiments.md` (config → val macro F_0.5)
-
-**Done when:** best config identified with a documented val score.
-
-### A5 · Threshold re-optimization *(Hours 36–60)*
-- [ ] After every change, re-run `find_best_macro_f05_threshold`
-- [ ] Check threshold stability (is it at a boundary like 0.10? that signals a problem)
-- [ ] Verify singleton behavior: how many test entities predicted empty? Compare with expected singleton rate (~30%)
-- [ ] Consider **per-country thresholds** if error analysis shows different precision regimes
-
-**Done when:** threshold chosen with a stable, non-boundary optimum.
-
-### A6 · Final package + submission *(Hours 60–72)*
-- [ ] Freeze all code (tag the commit)
-- [ ] Run the pipeline one final time on the real test set
-- [ ] `validate_submission.py` PASS
-- [ ] Build the zip:
-  ```
-  team_submission.zip
-  ├── output/{matching_results.tsv, candidate_pairs.tsv}
-  ├── code/business_entity_resolution/{src/, README.md, requirements.txt}
-  └── Documentation_template.md
-  ```
-- [ ] Verify the zip is runnable from scratch (fresh venv, `pip install -r requirements.txt`, run pipeline)
-- [ ] Final leaderboard upload + package submission
-
-**Done when:** package submitted and leaderboard score recorded.
+### A6 · Final package
+- [ ] Fill `Documentation_template.md` (official template, already in repo root)
+- [ ] Build zip: `output/` + `code/business_entity_resolution/{src,README.md,requirements.txt}` + filled template
+- [ ] Verify clean-room reproduction (fresh venv, `pip install -r requirements.txt`, run pipeline)
+- [ ] `MODEL_LICENSE_AUDIT.md` for every shipped model (LightGBM MIT, XGBoost Apache-2.0, sklearn BSD)
 
 ---
 
-## 🔄 Handoff Points (who waits on whom)
+## 🔄 Handoff Points
 
 | Handoff | From → To | Trigger |
 |---------|-----------|---------|
-| H1 | Abhijit → All | Dataset downloaded — everyone starts real-data work |
-| H2 | Vishwesh → Abhijit | Blocking frozen (recall ≥ 0.95) — pipeline can run |
-| H3 | Karan → Abhijit | Features validated — training can proceed |
-| H4 | Abhijit → Karan | First submission → error analysis begins |
+| H1 | Abhijit → All | Dataset extracted to `data/dataset/{train,test}/` |
+| H2 | Vishwesh → Abhijit | Indic transliteration + blocking frozen (recall ≥99% @ budget) |
+| H3 | Karan → Abhijit | Oracle evaluator ready → training can be measured properly |
+| H4 | Abhijit → Karan | First end-to-end run → error analysis begins |
 | H5 | Karan → Vishwesh | Error analysis shows blocking misses → blocking push |
-| H6 | Everyone → Abhijit | Final freeze — package assembly |
+| H6 | All → Abhijit | Final freeze → package assembly |
 
 ---
 
 ## 📡 Communication Protocol
 
-### Async updates (every ~6 hours, in group chat)
+### Async updates (every ~6 hours, group chat)
 ```
 ✅ Done: <task> — <evidence/result>
 🔨 Doing: <task> — <ETA>
 🚧 Blocked: <task> — <what I need>
 ```
 
-### Daily sync (every 12 hours, 15 min voice)
-1. Blocking recall status (Vishwesh)
-2. Feature/error analysis status (Karan)
-3. Score status + next experiment (Abhijit)
-4. Re-assign anything blocked
-
 ### Branching
 ```
-main                  ← always working, always valid (releases)
+main                  ← always working, always valid
  ├── feat/blocking-*  ← Vishwesh
  ├── feat/features-*  ← Karan
  └── feat/model-*     ← Abhijit
 ```
-PR → 1 approval → merge. Never push directly to `main` after hour 14 (except Abhijit for submissions).
+PR → 1 approval → merge. No direct pushes to `main` after hour 14 (except Abhijit for submissions).
 
 ### Escalation rule
-If blocked > 30 minutes: post in chat immediately, don't grind silently. Time is the scarcest resource.
+If blocked > 30 minutes: post in chat immediately. Time is the scarcest resource.
 
 ---
 
@@ -237,8 +199,8 @@ If blocked > 30 minutes: post in chat immediately, don't grind silently. Time is
 
 A task is DONE only when:
 1. Code committed with a clear message
-2. Tests pass (`pytest tests/` for that module) or manual evidence attached
-3. Measurable result recorded (recall %, F_0.5, candidate reduction — whatever the task promises)
+2. Tests pass or manual evidence attached
+3. **Measurable result recorded** (recall %, F_0.5, candidate reduction, timing — whatever the task promises)
 4. Owner marked it `✅ Done` in the update protocol
 
 **"Works on my machine" is not done. "Evidence attached" is done.**
@@ -247,28 +209,43 @@ A task is DONE only when:
 
 ## 🎯 Team Goals (priority order)
 
-1. **Working submission on leaderboard** — by hour 14
-2. **Validation F_0.5 ≥ 0.85** — by hour 36
-3. **Blocking recall ≥ 0.97** — by hour 48
-4. **Complete package + methodology doc** — by hour 68
-5. **Top 50 (PPI interviews)** — stretch goal 🏆
+1. **Working submission on leaderboard** — within 14 hours of data landing
+2. **Blocking ≥99% pair recall @ ≤30 candidates/S1/source** — the ceiling
+3. **Validation macro F_0.5 ≥ 0.85** — stretch: ≥0.90
+4. **Oracle ceiling vs achieved reported separately** — no hiding losses
+5. **Complete package + methodology doc + validator PASS** — by hour 68
+6. **Top 100 (PPI interviews)** — target 🏆
 
 ---
 
-## 📌 Current Status Board (update as you go)
+## 📌 Current Status Board
 
 | Task | Owner | Status | Evidence |
 |------|-------|--------|----------|
-| V1 Normalization hardening | Vishwesh | ⬜ Not started | — |
-| V2 Address blocking precision | Vishwesh | 🔴 Critical, not started | — |
-| V3 Blocking recall push | Vishwesh | ⬜ Not started | — |
-| K1 Feature validation (real data) | Karan | ⬜ Blocked on data | — |
-| K2 Feature unit tests | Karan | ⬜ Not started | — |
-| K3 Error analysis tooling | Karan | ⬜ Not started | — |
-| K4 Feature improvement | Karan | ⬜ Not started | — |
-| A1 Data intake + profile | Abhijit | ⏳ Waiting for dataset | — |
-| A2 First pipeline run (real) | Abhijit | ⬜ Blocked on A1 | smoke test ✅ |
-| A3 First submission | Abhijit | ⬜ Blocked on A2 | — |
-| A4 Model tuning | Abhijit | ⬜ Not started | synthetic meta AP 0.965 ✅ |
-| A5 Threshold re-optimization | Abhijit | ⬜ Not started | — |
-| A6 Final package | Abhijit | ⬜ Not started | — |
+| **V1** Indic transliteration | Vishwesh | ⬜ Ready (spec written) | — |
+| **V2** Adaptive-K + bidirectional + keys | Vishwesh | ⬜ Ready | adaptive-K spec in BLUEPRINT §2.2 |
+| **V3** Region partitioning | Vishwesh | ⬜ Ready | — |
+| **V4** Candidate budget curve | Vishwesh | ⬜ Blocked on V2/V3 | — |
+| **K1** Oracle + bucket evaluator | Karan | ⬜ Ready | oracle formula in BLUEPRINT §2.6 |
+| **K2** Synthetic → real distribution | Karan | ⬜ Ready | real numbers in COMPETITIVE_INTEL §1 |
+| **K3** Feature validation | Karan | ⬜ Blocked on A1 | — |
+| **K4** Country-holdout test | Karan | ⬜ Blocked on H4 | — |
+| **K5** Error analysis + docs | Karan | ⬜ Blocked on H4 | — |
+| **A1** Vectorized features + Parquet | Abhijit | ⬜ Ready | — |
+| **A2** Negatives from blocking + OOF | Abhijit | ⬜ Blocked on A1 | — |
+| **A3** Decision layer (calibrate+excl+expected-F0.5) | Abhijit | ⬜ Ready (spec written) | — |
+| **A4** Scale benchmark + full run | Abhijit | ⬜ Blocked on dataset | — |
+| **A5** Validate + upload | Abhijit | ⬜ Blocked on A4 | official validator ✅ |
+| **A6** Final package | Abhijit | ⬜ Blocked on A5 | official template ✅ |
+
+### Completed foundation (before this board)
+| Item | Status | Evidence |
+|------|--------|----------|
+| Repo + venv + dependencies | ✅ | `44525e1`…`deb07de` pushed |
+| 35 pairwise features (incl. missingness + contradiction) | ✅ | `tests/test_smoke.py` PASS (35 features) |
+| Scale-safe blocking (chunked sparse + top-K caps) | ✅ | measured 99.2% recall @ 17 cand/S1 on synthetic |
+| Leak-free OOF stacking | ✅ | meta OOF AP 0.9849 / val AP 0.9648 (synthetic) |
+| Macro F_0.5 threshold + evaluator | ✅ | verified against official worked example |
+| Official validator integrated | ✅ | PASS on synthetic outputs |
+| Synthetic generator + smoke test | ✅ | `tests/fixtures_synth` (300 entities) |
+| Competitive intel + implementation blueprint | ✅ | `docs/COMPETITIVE_INTEL.md`, `docs/IMPLEMENTATION_BLUEPRINT.md` |
