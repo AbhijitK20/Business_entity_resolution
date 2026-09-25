@@ -1,8 +1,82 @@
-"""Text normalization module for business names and addresses."""
+"""Text normalization module for business names and addresses.
+
+Includes Indic→Latin transliteration (ITRANS + word-final schwa deletion)
+ported from the SABER team's measured approach — fixes the 22.7% of India
+S1–S2 pairs that are cross-script (India recall@20 0.835 → 0.992 in their
+measurements).
+"""
 import re
 import unicodedata
 import pandas as pd
 from typing import Optional
+
+# --- Indic transliteration (optional dependency, graceful fallback) ---------
+try:
+    from indic_transliteration import sanscript
+    from indic_transliteration.sanscript import transliterate as _itrans
+    _HAS_INDIC = True
+except ImportError:  # pragma: no cover - fallback path
+    _HAS_INDIC = False
+
+# 9 script blocks: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya,
+# Tamil, Telugu, Kannada, Malayalam
+_INDIC_BLOCKS = [
+    (0x0900, "devanagari"), (0x0980, "bengali"), (0x0A00, "gurmukhi"),
+    (0x0A80, "gujarati"), (0x0B00, "oriya"), (0x0B80, "tamil"),
+    (0x0C00, "telugu"), (0x0C80, "kannada"), (0x0D00, "malayalam"),
+]
+_INDIC_RUN = re.compile(r"[\u0900-\u0D7F\u200c\u200d]+")
+_INDIC_ANY = re.compile(r"[\u0900-\u0D7F]")
+
+
+def _script_of(ch: str) -> Optional[str]:
+    """Return the script name for an Indic character, else None."""
+    o = ord(ch)
+    for base, name in _INDIC_BLOCKS:
+        if base <= o < base + 0x80:
+            return name
+    return None
+
+
+def _translit_run(match: "re.Match") -> str:
+    """Transliterate one Indic run to Latin (ITRANS + schwa deletion)."""
+    text = match.group(0).replace("\u200c", "").replace("\u200d", "")
+    script_name = next((_script_of(c) for c in text if _script_of(c)), None)
+    if script_name is None or not _HAS_INDIC:
+        return text
+    script = getattr(sanscript, script_name.upper())
+    out = _itrans(text, script, sanscript.ITRANS)
+    # word-final schwa deletion: rama -> ram, marketinga -> marketing
+    out = re.sub(r"(?<=[^aeiouAEIOU\s])a\b", "", out)
+    # ITRANS cleanups for anusvara / conjuncts
+    out = (out.replace("~N", "n").replace(".N", "n")
+              .replace("M", "n").replace("JN", "gy"))
+    return out
+
+
+def transliterate_indic(text: str) -> str:
+    """Replace every Indic-script run in `text` with Latin transliteration."""
+    if not text or not _INDIC_ANY.search(text):
+        return text
+    return _INDIC_RUN.sub(_translit_run, text)
+
+
+def is_non_latin(text: str) -> int:
+    """1 if the text contains any non-Latin letters (script feature)."""
+    if not text:
+        return 0
+    for ch in text:
+        if ch.isalpha() and "LATIN" not in unicodedata.name(ch, ""):
+            return 1
+    return 0
+
+
+# Ligature map for French/European characters (œ, æ, ß, ø, ł, đ, curly apostrophe)
+_LIGATURE_MAP = str.maketrans({
+    "œ": "oe", "Œ": "OE", "æ": "ae", "Æ": "AE", "ß": "ss",
+    "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
+    "’": "'",
+})
 
 
 # Legal suffixes to strip — covers US, India, UK, France, Germany forms
@@ -71,9 +145,13 @@ def normalize_name(name: Optional[str]) -> str:
     
     name = str(name)
     
-    # Step 1: Unicode normalization (handle accented chars)
+    # Step 0: Indic → Latin transliteration (before ASCII folding destroys it)
+    name = transliterate_indic(name)
+    
+    # Step 1: Ligatures + Unicode normalization (handles accented chars)
+    name = name.translate(_LIGATURE_MAP)
     name = unicodedata.normalize("NFKD", name)
-    name = name.encode("ascii", "ignore").decode("ascii")
+    name = "".join(c for c in name if not unicodedata.combining(c))
     
     # Step 2: Lowercase
     name = name.lower()
@@ -94,7 +172,7 @@ def normalize_name(name: Optional[str]) -> str:
     for ch in "&'/,.":
         name = name.replace(ch, " ")
     
-    # Step 7: Strip non-alphanumeric
+    # Step 7: Strip non-alphanumeric (Unicode-aware \w keeps any residual letters)
     name = re.sub(r"[^\w\s]", " ", name)
     
     # Step 8: Collapse whitespace
@@ -119,7 +197,14 @@ def normalize_address(addr: Optional[str]) -> str:
     if pd.isna(addr) or addr == "":
         return ""
     
-    addr = str(addr).lower()
+    addr = str(addr)
+    
+    # Step 0: Indic → Latin transliteration, then ligatures
+    addr = transliterate_indic(addr)
+    addr = addr.translate(_LIGATURE_MAP)
+    addr = unicodedata.normalize("NFKD", addr)
+    addr = "".join(c for c in addr if not unicodedata.combining(c))
+    addr = addr.lower()
     
     # Expand street abbreviations
     for pattern, replacement in STREET_ABBREVS.items():

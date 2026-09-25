@@ -380,6 +380,208 @@ def union_candidates(*candidate_dicts: Dict[int, Set[str]]) -> Dict[int, Set[str
     return union
 
 
+# ---------------------------------------------------------------------------
+# Adaptive-K pruning + bidirectional retrieval (ported from SABER's measured
+# approach: reverse legs + adaptive K lifted India union recall 0.9779 → 0.9903)
+# ---------------------------------------------------------------------------
+
+def adaptive_prune(
+    idx: np.ndarray,
+    sc: np.ndarray,
+    kmin: int,
+    kmax: int,
+    gap: float,
+) -> np.ndarray:
+    """Row-wise adaptive-K keep mask over (n, K) candidate matrices.
+
+    Keep rank < kmin, OR score >= top1 - gap, up to kmax.
+    Exact formula from SABER's blocker.
+    """
+    k = idx.shape[1]
+    r = np.arange(k)[None, :]
+    return (idx >= 0) & (r < kmax) & ((r < kmin) | (sc >= sc[:, :1] - gap))
+
+
+def _topk_from_sparse_row(data, indices, kmax):
+    """Return (indices, scores) of the top-kmax entries of one sparse row."""
+    if len(data) > kmax:
+        pos = np.argpartition(-data, kmax)[:kmax]
+        data, indices = data[pos], indices[pos]
+    order = np.argsort(-data)
+    return indices[order], data[order]
+
+
+def tfidf_blocking_adaptive(
+    query_names: List[str],
+    target_names: List[str],
+    target_ids: List[str],
+    threshold: float = 0.10,
+    kmin: int = 5,
+    kmax: int = 30,
+    gap: float = 0.10,
+    max_features: int = 10000,
+    chunk_size: int = 512,
+) -> Tuple[Dict[int, Set[str]], Dict[int, Dict[str, float]]]:
+    """TF-IDF blocking with SABER's adaptive-K prune.
+
+    Returns:
+        candidates: {query_idx: set(target_ids)}
+        scores:     {query_idx: {target_id: cosine_score}}  (for provenance features)
+    """
+    if not query_names or not target_names:
+        return {}, {}
+
+    all_names = query_names + target_names
+    tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=max_features,
+                            analyzer="word", dtype=np.float32)
+    tfidf_matrix = tfidf.fit_transform(all_names)
+    query_matrix = tfidf_matrix[:len(query_names)]
+    target_matrix = tfidf_matrix[len(query_names):].T.tocsr()
+
+    candidates: Dict[int, Set[str]] = defaultdict(set)
+    scores: Dict[int, Dict[str, float]] = defaultdict(dict)
+    n_queries = query_matrix.shape[0]
+
+    for start in range(0, n_queries, chunk_size):
+        end = min(start + chunk_size, n_queries)
+        sims = (query_matrix[start:end] @ target_matrix).tocsr()
+        for local_i in range(end - start):
+            row = sims.getrow(local_i)
+            if row.nnz == 0:
+                continue
+            keep = row.data >= threshold
+            if not keep.any():
+                continue
+            data, indices = row.data[keep], row.indices[keep]
+            top_idx, top_sc = _topk_from_sparse_row(data, indices, kmax)
+            idx_arr = top_idx[None, :]
+            sc_arr = top_sc[None, :]
+            mask = adaptive_prune(idx_arr, sc_arr, kmin, kmax, gap)[0]
+            q_idx = start + local_i
+            for t_pos, s in zip(top_idx[mask], top_sc[mask]):
+                tid = target_ids[t_pos]
+                candidates[q_idx].add(tid)
+                scores[q_idx][tid] = float(s)
+
+    return candidates, scores
+
+
+def bidirectional_tfidf(
+    s1_names: List[str],
+    gallery_names: List[str],
+    gallery_ids: List[str],
+    threshold: float = 0.10,
+    forward_kmin: int = 5, forward_kmax: int = 30, forward_gap: float = 0.10,
+    reverse_kmin: int = 2, reverse_kmax: int = 5, reverse_gap: float = 0.05,
+    max_features: int = 10000,
+) -> Tuple[Dict[int, Set[str]], Dict[int, Dict[str, float]]]:
+    """Run TF-IDF blocking in BOTH directions and union.
+
+    Forward: S1 → gallery (top forward_kmax per S1)
+    Reverse: gallery → S1 (top reverse_kmax per gallery record; because each
+             S2/S3 matches at most one S1, this cheap direction is high-recall)
+
+    Returns (candidates, scores) where scores hold the max score seen.
+    """
+    fwd_c, fwd_s = tfidf_blocking_adaptive(
+        s1_names, gallery_names, gallery_ids,
+        threshold=threshold, kmin=forward_kmin, kmax=forward_kmax, gap=forward_gap,
+        max_features=max_features,
+    )
+
+    # Reverse: for each gallery record, find its top S1s, then invert
+    rev_c, rev_s = tfidf_blocking_adaptive(
+        gallery_names, s1_names, [str(i) for i in range(len(s1_names))],
+        threshold=threshold, kmin=reverse_kmin, kmax=reverse_kmax, gap=reverse_gap,
+        max_features=max_features,
+    )
+    candidates: Dict[int, Set[str]] = defaultdict(set)
+    scores: Dict[int, Dict[str, float]] = defaultdict(dict)
+
+    for s1_idx, cands in fwd_c.items():
+        candidates[s1_idx].update(cands)
+        scores[s1_idx].update(fwd_s.get(s1_idx, {}))
+
+    gallery_id_to_pos = {gid: i for i, gid in enumerate(gallery_ids)}
+    for gal_idx, s1_strs in rev_c.items():
+        gal_id = gallery_ids[gal_idx]
+        for s1_str in s1_strs:
+            s1_idx = int(s1_str)
+            candidates[s1_idx].add(gal_id)
+            rev_score = rev_s.get(gal_idx, {}).get(s1_str, 0.0)
+            if rev_score > scores[s1_idx].get(gal_id, 0.0):
+                scores[s1_idx][gal_id] = rev_score
+
+    return candidates, scores
+
+
+def key_blocking(
+    s1_df: pd.DataFrame,
+    gallery_df: pd.DataFrame,
+    address_key_min_len: int = 12,
+    max_bucket: int = 30,
+    max_addr_bucket: int = 200,
+) -> Dict[int, Set[str]]:
+    """Exact-key blocking legs (SABER/vaibhav/resolvers consensus).
+
+    - address key: exact normalized address of >= address_key_min_len chars
+      (bucket capped at max_addr_bucket — shared buildings/malls)
+    - name key: core name (legal-stripped) + last two address tokens
+      (buckets > max_bucket dropped as too generic)
+    - PIN/ZIP key: 5-6 digit runs in the address (India PIN / US ZIP)
+    """
+    candidates: Dict[int, Set[str]] = defaultdict(set)
+    gallery_ids = gallery_df["entity_id"].tolist()
+    s1_ids = s1_df["entity_id"].tolist()
+
+    def _build_index(key_fn):
+        index: Dict[str, List[str]] = defaultdict(list)
+        for gid, name, addr in zip(gallery_ids,
+                                   gallery_df["business_name_clean"].fillna("").tolist(),
+                                   gallery_df["business_address_clean"].fillna("").tolist()):
+            for k in key_fn(name, addr):
+                index[k].append(gid)
+        return index
+
+    addr_index = _build_index(lambda n, a: [a] if len(a) >= address_key_min_len else [])
+    name_index = _build_index(_name_core_key)
+    pin_index = _build_index(lambda n, a: _pin_keys(a))
+
+    for s1_idx, name, addr in zip(range(len(s1_ids)),
+                                  s1_df["business_name_clean"].fillna("").tolist(),
+                                  s1_df["business_address_clean"].fillna("").tolist()):
+        for k in ([addr] if len(addr) >= address_key_min_len else []):
+            bucket = addr_index.get(k, [])
+            if 0 < len(bucket) <= max_addr_bucket:
+                candidates[s1_idx].update(bucket)
+        for k in _name_core_key(name, addr):
+            bucket = name_index.get(k, [])
+            if 0 < len(bucket) <= max_bucket:
+                candidates[s1_idx].update(bucket)
+        for k in _pin_keys(addr):
+            candidates[s1_idx].update(pin_index.get(k, []))
+
+    return candidates
+
+
+def _name_core_key(name: str, addr: str) -> List[str]:
+    """Core name (legal-stripped) + last two address tokens; core must be >=3 chars."""
+    from .normalize import LEGAL_SUFFIXES
+    tokens = [t for t in name.split()
+              if t and not any(re.fullmatch(p.replace(r"\b", "").rstrip("?.\\"), t)
+                               for p in LEGAL_SUFFIXES)]
+    core = " ".join(tokens).strip()
+    if len(core) < 3:
+        return []
+    addr_tokens = addr.split()[-2:]
+    return [f"{core}|{' '.join(addr_tokens)}"]
+
+
+def _pin_keys(addr: str) -> List[str]:
+    """5-6 digit runs = PIN (India) / ZIP (US) candidates."""
+    return re.findall(r"\b\d{5,6}\b", addr)
+
+
 def measure_blocking_quality(
     candidates: Dict[int, Set[str]],
     ground_truth: Dict[str, list],

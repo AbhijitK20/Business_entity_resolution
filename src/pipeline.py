@@ -27,6 +27,7 @@ from .blocking import (
     tfidf_blocking_candidates, phonetic_blocking, initialism_blocking,
     exact_blocking, minhash_lsh_candidates, address_tfidf_candidates,
     union_candidates, measure_blocking_quality,
+    bidirectional_tfidf, key_blocking, cap_candidates,
 )
 from .features import compute_features_batch, FEATURE_NAMES
 from .training import (
@@ -36,6 +37,7 @@ from .model import (
     train_base_models, train_meta_learner, find_best_f05_threshold,
     find_best_macro_f05_threshold, save_model, load_model,
 )
+from .decision import select_sets_expected_f05
 
 
 class EntityResolutionPipeline:
@@ -170,9 +172,9 @@ class EntityResolutionPipeline:
         
         print(f"  S1: {len(s1_names)} entities, S2+S3: {len(s2_s3_names)} records")
         
-        # Layer 1: TF-IDF on names
-        print("  Layer 1: TF-IDF name blocking...")
-        c1 = tfidf_blocking_candidates(s1_names, s2_s3_names, s2_s3_ids, threshold=0.25)
+        # Layer 1: TF-IDF on names — BIDIRECTIONAL with adaptive-K (SABER)
+        print("  Layer 1: Bidirectional TF-IDF (adaptive-K)...")
+        c1, _ = bidirectional_tfidf(s1_names, s2_s3_names, s2_s3_ids)
         
         # Layer 2: Token-sorted TF-IDF
         print("  Layer 2: Token-sorted blocking...")
@@ -192,16 +194,17 @@ class EntityResolutionPipeline:
         print("  Layer 5: Address TF-IDF blocking...")
         c5 = address_tfidf_candidates(s1_addrs, s2_s3_addrs, s2_s3_ids, threshold=0.25)
         
-        # Layer 6: Country partition (already enforced in blocking)
-        print("  Layer 6: Country partition...")
-        c6 = {}  # Country is handled in candidate filtering
+        # Layer 6: Exact keys — address / name-core / PIN-ZIP (SABER + SIBAM)
+        print("  Layer 6: Exact key blocking (address/name/PIN)...")
+        c6 = key_blocking(s1_df, s2_s3_df)
         
         # Layer 7: MinHash LSH
         print("  Layer 7: MinHash LSH blocking...")
         c7 = minhash_lsh_candidates(s1_names, s2_s3_names, s2_s3_ids, threshold=0.3)
         
-        # Union all candidates
-        candidates = union_candidates(c1, c2, c3, c4, c5, c7)
+        # Union all candidates + final per-entity budget
+        candidates = union_candidates(c1, c2, c3, c4, c5, c6, c7)
+        candidates = cap_candidates(candidates, max_per_query=30)
         
         total_pairs = len(s1_names) * len(s2_s3_names)
         if ground_truth is not None:
@@ -272,17 +275,22 @@ class EntityResolutionPipeline:
         X_meta = np.column_stack([lgb_proba, xgb_proba, rf_proba])
         meta_proba = self.meta_model.predict_proba(X_meta)[:, 1]
         
-        # Apply threshold — vectorized match building
-        mask = meta_proba >= self.best_threshold
-        kept = features_df[mask]
+        # --- Entity-level decision: exclusivity + expected-F0.5 --------------
         test_s1_ids = s1_df["entity_id"].tolist()
+        pair_s1_ids = [test_s1_ids[i] for i in features_df["s1_idx"].tolist()]
+        pair_cand_ids = features_df["s2_s3_id"].tolist()
         
-        self.test_predictions = {}
-        for s1_idx, cand_id in zip(kept["s1_idx"].tolist(), kept["s2_s3_id"].tolist()):
-            self.test_predictions.setdefault(test_s1_ids[s1_idx], []).append(cand_id)
+        decisions = select_sets_expected_f05(
+            pair_s1_ids, pair_cand_ids, meta_proba,
+            anchor_ids=test_s1_ids,
+        )
+        self.test_predictions = {sid: sorted(matched) for sid, matched in decisions.items()}
         
-        n_pairs_kept = int(mask.sum())
-        print(f"  Kept {n_pairs_kept} matches across {len(self.test_predictions)} S1 entities")
+        n_kept = sum(len(v) for v in self.test_predictions.values())
+        n_empty = sum(1 for v in self.test_predictions.values() if not v)
+        print(f"  Kept {n_kept} matches; {n_empty}/{len(test_s1_ids)} S1 predicted empty")
+        print(f"  (decision: exclusivity + expected-F0.5, threshold fallback "
+              f"{self.best_threshold:.2f})")
     
     def _generate_output(self):
         """Generate matching_results.tsv and candidate_pairs.tsv."""
