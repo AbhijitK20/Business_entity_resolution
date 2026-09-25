@@ -7,18 +7,35 @@ __pycache__/
 venv/
 env/
 ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Data (large files)
+# Data (large files - never commit)
 dataset/
+data/
 *.tsv
 *.csv
+!requirements.txt
 
-# Models
-models/*.pkl
-models/*.joblib
+# Models (binary artifacts)
+models/
+*.pkl
+*.joblib
+*.onnx
+*.h5
 
-# Output
+# Output (submission files)
 output/
+*.zip
+
+# Research repos (cloned separately, not part of project)
+research/
+freellmapi/
+
+# Personal folders
+docs by me/
+docs by u/
 
 # IDE
 .vscode/
@@ -33,6 +50,8 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
-# Environment
+# Environment / secrets
 .env
 *.log
+token.json
+credentials.json
