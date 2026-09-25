@@ -18,78 +18,115 @@ def generate_hard_negatives(
     n_neg_per_pos: int = 2,
     hard_ratio: float = 0.7,
     random_seed: int = 42,
+    candidates: Dict[int, set] = None,
+    max_fallback_pool: int = 300,
 ) -> pd.DataFrame:
     """Generate hard negative pairs for training.
-    
+
     Strategy:
-    - 70% hard negatives: same country, similar name, NOT in positives
-    - 30% random negatives: different country or very different name
-    
+    - 70% hard negatives: non-matching candidates from the blocking output
+      (or, without candidates, same-country records ranked by name similarity)
+    - 30% random negatives: different country where possible
+
     From ted-entity-resolution and name-matching.
+
+    Scale note: when ``candidates`` ({s1_pos_idx: set(ids)}, the blocking
+    output) is provided, hard negatives are sampled from each S1's own
+    candidate pool. This avoids the naive O(n_s1 x n_gallery) full scan (which
+    is ~6B fuzzy comparisons on the 2.5% world — hours) and matches the
+    inference-time candidate distribution.
     """
-    np.random.seed(random_seed)
-    
+    rng = np.random.default_rng(random_seed)
+    s1_ids = s1_df["entity_id"].tolist()
+    s1_index = {sid: i for i, sid in enumerate(s1_ids)}
+    s1_name_by_id = dict(zip(s1_ids, s1_df["business_name_clean"].fillna("").tolist()))
+    s1_country_by_id = dict(zip(s1_ids, s1_df["country_clean"].fillna("").tolist()))
+
+    gallery_ids = s2_s3_df["entity_id"].to_numpy()
+    gallery_country = s2_s3_df["country_clean"].fillna("").to_numpy()
+    gallery_name = s2_s3_df["business_name_clean"].fillna("").to_numpy()
+    id_to_row = {eid: i for i, eid in enumerate(gallery_ids)}
+    by_country = {}
+    for i, c in enumerate(gallery_country):
+        by_country.setdefault(c, []).append(i)
+    by_country = {c: np.array(v, dtype=np.int64) for c, v in by_country.items()}
+
+    n_hard = int(n_neg_per_pos * hard_ratio)
+    n_random = n_neg_per_pos - n_hard
+
     negatives = []
-    
     for s1_id, matched_ids in ground_truth.items():
-        # Get S1 record
-        s1_mask = s1_df["entity_id"] == s1_id
-        if not s1_mask.any():
+        q_idx = s1_index.get(s1_id)
+        if q_idx is None:
             continue
-        s1_record = s1_df[s1_mask].iloc[0]
-        s1_name = s1_record.get("business_name_clean", "")
-        s1_country = s1_record.get("country_clean", "")
-        
-        # Pool of candidates (exclude positives; for singletons, exclude nothing)
-        positive_set = set(matched_ids)
-        candidates = s2_s3_df[~s2_s3_df["entity_id"].isin(positive_set)].copy()
-        
-        if len(candidates) == 0:
-            continue
-        
-        # Hard negatives: same country, compute name similarity
-        n_hard = int(n_neg_per_pos * hard_ratio)
-        n_random = n_neg_per_pos - n_hard
-        
-        same_country = candidates[candidates["country_clean"] == s1_country]
-        
-        if len(same_country) > 0:
-            # Compute similarity scores
-            sims = same_country["business_name_clean"].apply(
-                lambda x: fuzz.WRatio(s1_name, x) if pd.notna(x) else 0
-            )
-            same_country = same_country.copy()
-            same_country["sim"] = sims.values
-            same_country = same_country.sort_values("sim", ascending=False)
-            
-            # Take top N hardest
-            hard_candidates = same_country.head(n_hard)
-            for _, cand in hard_candidates.iterrows():
+        pos = set(matched_ids)
+        chosen = set()
+
+        # --- hard negatives ---
+        if candidates is not None and candidates.get(q_idx):
+            pool = [cid for cid in candidates[q_idx] if cid not in pos]
+            if len(pool) > 200:  # bound the fuzzy ranking cost
+                pool = list(rng.choice(pool, size=200, replace=False))
+            if pool and n_hard > 0:
+                s1_name = s1_name_by_id.get(s1_id, "")
+                sims = np.array([
+                    fuzz.WRatio(s1_name, gallery_name[id_to_row[cid]])
+                    for cid in pool
+                ])
+                for i in np.argsort(-sims)[:n_hard]:
+                    cid = pool[i]
+                    if cid not in chosen:
+                        negatives.append({
+                            "s1_entity_id": s1_id,
+                            "candidate_entity_id": cid,
+                            "label": 0,
+                        })
+                        chosen.add(cid)
+        elif max_fallback_pool > 0:
+            # Bounded fallback (no blocking output available): sample a
+            # same-country pool and keep the most similar records.
+            rows = by_country.get(s1_country_by_id.get(s1_id, ""),
+                                  np.array([], dtype=np.int64))
+            if len(rows) > max_fallback_pool:
+                rows = rng.choice(rows, size=max_fallback_pool, replace=False)
+            pool = [gallery_ids[i] for i in rows if gallery_ids[i] not in pos]
+            if pool and n_hard > 0:
+                s1_name = s1_name_by_id.get(s1_id, "")
+                sims = np.array([
+                    fuzz.WRatio(s1_name, gallery_name[id_to_row[cid]])
+                    for cid in pool
+                ])
+                for i in np.argsort(-sims)[:n_hard]:
+                    cid = pool[i]
+                    negatives.append({
+                        "s1_entity_id": s1_id,
+                        "candidate_entity_id": cid,
+                        "label": 0,
+                    })
+                    chosen.add(cid)
+
+        # --- random negatives (prefer different country) ---
+        if n_random > 0 and len(gallery_ids) > 0:
+            s1_country = s1_country_by_id.get(s1_id, "")
+            got = 0
+            attempts = 0
+            while got < n_random and attempts < 40:
+                attempts += 1
+                i = int(rng.integers(0, len(gallery_ids)))
+                cid = gallery_ids[i]
+                if cid in pos or cid in chosen:
+                    continue
+                # Prefer a different country for the first ~15 attempts.
+                if gallery_country[i] == s1_country and attempts <= 15:
+                    continue
                 negatives.append({
                     "s1_entity_id": s1_id,
-                    "candidate_entity_id": cand["entity_id"],
+                    "candidate_entity_id": cid,
                     "label": 0,
                 })
-        
-        # Random negatives: different country
-        if n_random > 0:
-            diff_country = candidates[candidates["country_clean"] != s1_country]
-            if len(diff_country) >= n_random:
-                random_sample = diff_country.sample(n_random, random_state=random_seed)
-                for _, cand in random_sample.iterrows():
-                    negatives.append({
-                        "s1_entity_id": s1_id,
-                        "candidate_entity_id": cand["entity_id"],
-                        "label": 0,
-                    })
-            elif len(diff_country) > 0:
-                for _, cand in diff_country.iterrows():
-                    negatives.append({
-                        "s1_entity_id": s1_id,
-                        "candidate_entity_id": cand["entity_id"],
-                        "label": 0,
-                    })
-    
+                chosen.add(cid)
+                got += 1
+
     return pd.DataFrame(negatives)
 
 
@@ -114,9 +151,14 @@ def construct_training_pairs(
     ground_truth: Dict[str, list],
     n_neg_per_pos: int = 2,
     random_seed: int = 42,
+    candidates: Dict[int, set] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Construct training pairs with positives and hard negatives.
-    
+
+    ``candidates`` is the blocking output ({s1_pos_idx: set(ids)}) — when
+    provided, hard negatives are sampled from it (scale-safe + matches the
+    inference-time candidate distribution).
+
     Returns:
         pairs_df: DataFrame with [s1_entity_id, candidate_entity_id, label]
         splits: DataFrame with train/val split information
@@ -129,6 +171,7 @@ def construct_training_pairs(
         s1_df, s2_s3_df, ground_truth,
         n_neg_per_pos=n_neg_per_pos,
         random_seed=random_seed,
+        candidates=candidates,
     )
     
     # Combine

@@ -83,6 +83,9 @@ def main():
                     help="fraction of S1 to sample (SABER used 0.025)")
     ap.add_argument("--distractor-fraction", type=float, default=None,
                     help="fraction of distractor records to keep (default = fraction)")
+    ap.add_argument("--test-frac", type=float, default=0.0,
+                    help="fraction of sampled S1 held out as a local test split "
+                         "(0 = train only; gallery records follow their matched S1)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -91,6 +94,10 @@ def main():
     out = Path(args.out)
     (out / "dataset" / "train").mkdir(parents=True, exist_ok=True)
     d = out / "dataset" / "train"
+    split_mode = args.test_frac > 0
+    if split_mode:
+        t = out / "dataset" / "test"
+        t.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("BUILDING SAMPLED WORLD")
@@ -104,6 +111,14 @@ def main():
     print(f"\n[2] Sampling {args.fraction:.1%} of S1 per country...")
     sampled_s1 = sample_ids_per_country(country_map, args.fraction, rng)
 
+    # Optional local train/test split (gallery records follow their matched S1,
+    # mirroring the real competition layout where test records match only test S1)
+    test_s1 = set()
+    if split_mode:
+        n_test = int(len(sampled_s1) * args.test_frac)
+        test_s1 = set(rng.sample(sorted(sampled_s1), n_test))
+        print(f"  split: test S1={len(test_s1):,}  train S1={len(sampled_s1)-len(test_s1):,}")
+
     # True matches of sampled S1 must all be in the gallery
     needed_matches = set()
     for sid in sampled_s1:
@@ -113,12 +128,18 @@ def main():
     # Distractor sampling: keep `distractor_fraction` of records NOT in needed_matches
     df_frac = args.distractor_fraction if args.distractor_fraction is not None else args.fraction
 
+    # Build matched-id -> split lookup
+    id_split = {}
+    for sid in sampled_s1:
+        s = "test" if sid in test_s1 else "train"
+        for mid in gt.get(sid, []):
+            id_split[mid] = s
+
     print(f"\n[3] Building gallery (all true matches + {df_frac:.1%} distractors)...")
     for src in ("source2", "source3"):
         src_path = base / f"train_{src}.tsv"
-        kept_rows = []
-        kept_matches = 0
-        distractors_kept = 0
+        train_rows, test_rows = [], []
+        kept_matches = distractors_kept = 0
         total = 0
         with open(src_path, newline="", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter="\t")
@@ -129,30 +150,56 @@ def main():
                 total += 1
                 eid = rec[0]
                 if eid in needed_matches:
-                    kept_rows.append(rec)
+                    split = id_split.get(eid, "train")
+                    (test_rows if split == "test" else train_rows).append(rec)
                     kept_matches += 1
                 elif rng.random() < df_frac:
-                    kept_rows.append(rec)
+                    # Distractor: assign to the local test gallery only in split
+                    # mode, at the test fraction.
+                    if split_mode and rng.random() < args.test_frac:
+                        test_rows.append(rec)
+                    else:
+                        train_rows.append(rec)
                     distractors_kept += 1
-        write_rows(d / f"train_{src}.tsv", kept_rows,
+        write_rows(d / f"train_{src}.tsv", train_rows,
                    ["entity_id", "business_name", "business_address", "country"])
         print(f"  {src}: total={total:,} | matches kept={kept_matches:,} | "
-              f"distractors kept={distractors_kept:,} | gallery={len(kept_rows):,}")
+              f"distractors kept={distractors_kept:,} | train={len(train_rows):,}"
+              + (f" test={len(test_rows):,}" if split_mode else ""))
+        if split_mode:
+            write_rows(t / f"test_{src}.tsv", test_rows,
+                       ["entity_id", "business_name", "business_address", "country"])
 
     print("\n[4] Writing sampled S1 + ground truth...")
+    train_s1 = sampled_s1 - test_s1 if split_mode else sampled_s1
     s1_rows = []
-    filter_source(base / "train_source1.tsv", sampled_s1, s1_rows,
+    filter_source(base / "train_source1.tsv", train_s1, s1_rows,
                   ["entity_id", "business_name", "business_address", "country"])
     write_rows(d / "train_source1.tsv", s1_rows,
                ["entity_id", "business_name", "business_address", "country"])
 
-    gt_rows = [[sid, ",".join(gt.get(sid, []))] for sid in sampled_s1]
+    gt_rows = [[sid, ",".join(gt.get(sid, []))] for sid in sorted(train_s1)]
     write_rows(d / "train_ground_truth.tsv", gt_rows,
                ["source1_entity_id", "matched_entity_ids"])
 
-    n_with = sum(1 for sid in sampled_s1 if gt.get(sid))
-    print(f"  S1 rows: {len(s1_rows):,} | with matches: {n_with:,} | "
+    n_with = sum(1 for sid in train_s1 if gt.get(sid))
+    print(f"  train S1 rows: {len(s1_rows):,} | with matches: {n_with:,} | "
           f"singletons: {len(s1_rows) - n_with:,}")
+
+    if split_mode:
+        test_rows = []
+        filter_source(base / "train_source1.tsv", test_s1, test_rows,
+                      ["entity_id", "business_name", "business_address", "country"])
+        write_rows(t / "test_source1.tsv", test_rows,
+                   ["entity_id", "business_name", "business_address", "country"])
+        # Local-only ground truth for evaluation (the real competition does not
+        # ship test ground truth).
+        test_gt_rows = [[sid, ",".join(gt.get(sid, []))] for sid in sorted(test_s1)]
+        write_rows(t / "test_ground_truth.tsv", test_gt_rows,
+                   ["source1_entity_id", "matched_entity_ids"])
+        n_with_t = sum(1 for sid in test_s1 if gt.get(sid))
+        print(f"  test S1 rows: {len(test_rows):,} | with matches: {n_with_t:,} | "
+              f"singletons: {len(test_rows) - n_with_t:,}")
 
     print(f"\nWorld written → {d}")
     print(f"  S1={len(s1_rows):,}  S2={sum(1 for _ in open(d / 'train_source2.tsv')) - 1:,}  "

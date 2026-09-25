@@ -27,7 +27,7 @@ from .blocking import (
     tfidf_blocking_candidates, phonetic_blocking, initialism_blocking,
     exact_blocking, minhash_lsh_candidates, address_tfidf_candidates,
     union_candidates, measure_blocking_quality,
-    bidirectional_tfidf, key_blocking, cap_candidates,
+    bidirectional_tfidf, key_blocking, cap_candidates, cap_candidates_scored,
 )
 from .features import compute_features_batch, compute_features_vectorized, FEATURE_NAMES
 from .training import (
@@ -44,11 +44,18 @@ class EntityResolutionPipeline:
     """End-to-end entity resolution pipeline."""
 
     def __init__(self, data_dir: str, output_dir: str = "output",
-                 fast_mode: bool = False):
+                 fast_mode: bool = False, max_candidates: int = 50,
+                 use_dense_cap: bool = True,
+                 embedding_cache: str = "local_data/embeddings"):
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.fast_mode = fast_mode  # reduce Optuna trials for smoke-testing
+        # Per-S1 candidate budget + ranking. Measured on the real sampled world:
+        # scored dense reranking @50 keeps recall 0.8917 vs 0.291 for a raw cap.
+        self.max_candidates = max_candidates
+        self.use_dense_cap = use_dense_cap
+        self.embedding_cache = embedding_cache
 
         self.train_data = None
         self.test_data = None
@@ -98,7 +105,8 @@ class EntityResolutionPipeline:
         # Step 5: Construct training data
         print("\n[5/10] Constructing training data...")
         pairs, train_pairs, val_pairs = construct_training_pairs(
-            self.train_data["train_s1"], s2_s3_train, ground_truth
+            self.train_data["train_s1"], s2_s3_train, ground_truth,
+            candidates=candidates_train,
         )
         
         # Compute features
@@ -164,6 +172,50 @@ class EntityResolutionPipeline:
         print(f"Output files in: {self.output_dir}")
         print("=" * 60)
     
+    def _cap_candidates(
+        self,
+        candidates: Dict[int, set],
+        s1_names: list,
+        gallery_names: list,
+        gallery_ids: list,
+    ) -> Dict[int, set]:
+        """Apply the per-S1 candidate budget with similarity ranking.
+
+        Prefers dense (e5) reranking when the embedding stack is available;
+        falls back to fuzzy scoring, then to a raw cap as a last resort.
+        """
+        if self.use_dense_cap:
+            try:
+                from .dense_blocking import (
+                    MULTILINGUAL_MODEL, encode_texts,
+                )
+                q_emb = encode_texts(
+                    s1_names, model_name=MULTILINGUAL_MODEL,
+                    cache_dir=self.embedding_cache, role="query",
+                    show_progress=False,
+                )
+                g_emb = encode_texts(
+                    gallery_names, model_name=MULTILINGUAL_MODEL,
+                    cache_dir=self.embedding_cache, role="target",
+                    show_progress=False,
+                )
+                print(f"  Scored cap: dense rerank @{self.max_candidates}/S1 "
+                      f"(multilingual-e5-small)")
+                return cap_candidates_scored(
+                    candidates, s1_names, gallery_names, gallery_ids,
+                    max_per_query=self.max_candidates,
+                    dense_query_emb=q_emb, dense_target_emb=g_emb,
+                    dense_weight=1.0, verbose=True,
+                )
+            except ImportError as e:
+                print(f"  Scored cap: dense unavailable ({e}); using fuzzy")
+
+        print(f"  Scored cap: fuzzy rerank @{self.max_candidates}/S1")
+        return cap_candidates_scored(
+            candidates, s1_names, gallery_names, gallery_ids,
+            max_per_query=self.max_candidates, verbose=True,
+        )
+
     def _generate_candidates(
         self,
         s1_df: pd.DataFrame,
@@ -187,11 +239,13 @@ class EntityResolutionPipeline:
         print("  Layer 1: Bidirectional TF-IDF (adaptive-K)...")
         c1, _ = bidirectional_tfidf(s1_names, s2_s3_names, s2_s3_ids)
         
-        # Layer 2: Token-sorted TF-IDF
+        # Layer 2: Token-sorted TF-IDF (top_k cap required at scale: without
+        # it this leg produced 78M candidates on the 55K-entity sampled world)
         print("  Layer 2: Token-sorted blocking...")
         s1_sorted = [" ".join(sorted(n.split())) for n in s1_names]
         s2_s3_sorted = [" ".join(sorted(n.split())) for n in s2_s3_names]
-        c2 = tfidf_blocking_candidates(s1_sorted, s2_s3_sorted, s2_s3_ids, threshold=0.25)
+        c2 = tfidf_blocking_candidates(s1_sorted, s2_s3_sorted, s2_s3_ids,
+                                       threshold=0.25, top_k=30)
         
         # Layer 3: Phonetic (Soundex + Metaphone)
         print("  Layer 3: Phonetic blocking...")
@@ -203,7 +257,8 @@ class EntityResolutionPipeline:
         
         # Layer 5: Address TF-IDF
         print("  Layer 5: Address TF-IDF blocking...")
-        c5 = address_tfidf_candidates(s1_addrs, s2_s3_addrs, s2_s3_ids, threshold=0.25)
+        c5 = address_tfidf_candidates(s1_addrs, s2_s3_addrs, s2_s3_ids,
+                                      threshold=0.25, top_k=30)
         
         # Layer 6: Exact keys — address / name-core / PIN-ZIP (SABER + SIBAM)
         print("  Layer 6: Exact key blocking (address/name/PIN)...")
@@ -213,9 +268,11 @@ class EntityResolutionPipeline:
         print("  Layer 7: MinHash LSH blocking...")
         c7 = minhash_lsh_candidates(s1_names, s2_s3_names, s2_s3_ids, threshold=0.3)
         
-        # Union all candidates + final per-entity budget
+        # Union all candidates + scored per-entity budget
         candidates = union_candidates(c1, c2, c3, c4, c5, c6, c7)
-        candidates = cap_candidates(candidates, max_per_query=30)
+        candidates = self._cap_candidates(
+            candidates, s1_names, s2_s3_names, s2_s3_ids
+        )
         
         total_pairs = len(s1_names) * len(s2_s3_names)
         if ground_truth is not None:
@@ -374,9 +431,20 @@ def main():
         "OUTPUT_DIR", "/home/abhijitk20/Amazon ML/output"))
     parser.add_argument("--fast", action="store_true",
                         help="Fast mode: few Optuna trials (for smoke tests)")
+    parser.add_argument("--max-candidates", type=int, default=50,
+                        help="Per-S1 candidate budget after scored reranking")
+    parser.add_argument("--no-dense-cap", action="store_true",
+                        help="Disable dense (e5) reranking; use fuzzy scoring")
+    parser.add_argument("--embedding-cache", default="local_data/embeddings",
+                        help="Directory for cached embedding arrays")
     args = parser.parse_args()
 
-    pipeline = EntityResolutionPipeline(args.data_dir, args.output_dir, fast_mode=args.fast)
+    pipeline = EntityResolutionPipeline(
+        args.data_dir, args.output_dir, fast_mode=args.fast,
+        max_candidates=args.max_candidates,
+        use_dense_cap=not args.no_dense_cap,
+        embedding_cache=args.embedding_cache,
+    )
     pipeline.run()
 
 
