@@ -1,9 +1,22 @@
 # Amazon ML Challenge 2026 — Business Entity Resolution
 
+**Team:** Abhijit · Vishwesh · Karan
 **Team repo:** https://github.com/AbhijitK20/Business_entity_resolution
 **Hackathon:** 25–27 September 2026 (72 hours)
 
 > **📖 Start here:** [MASTERPLAN.md](MASTERPLAN.md) — problem, data, architecture, team division, timeline, and current status.
+
+---
+
+## Team & Roles
+
+| Member | Role | Owns |
+|--------|------|------|
+| **Abhijit** | Lead — pipeline, model, submissions | `src/pipeline.py`, `src/model.py`, `src/training.py`, `src/data_loader.py` |
+| **Vishwesh** | Blocking engineer | `src/normalize.py`, `src/blocking.py` |
+| **Karan** | Feature engineer | `src/features.py`, `scripts/evaluate.py` |
+
+➡️ Detailed assignments: [TASK_BREAKDOWN.md](TASK_BREAKDOWN.md)
 
 ---
 

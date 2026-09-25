@@ -2,6 +2,8 @@
 
 ## Team PRD (Product Requirements Document)
 
+**Team:** Abhijit (lead) · Vishwesh · Karan
+
 ---
 
 ## 1. Problem Statement

@@ -158,18 +158,23 @@ Rules: every S1 present · no duplicates in a list · only S2/S3 IDs from the te
 
 ## 6. TEAM DIVISION (3 people, parallel streams)
 
+**Team:** Abhijit · Vishwesh · Karan
+
 | Stream | Owner | Deliverable | Can start |
 |--------|-------|-------------|-----------|
-| **A · Blocking** | Member 2 | `src/normalize.py`, `src/blocking.py` + recall report | Immediately |
-| **B · Features** | Member 3 | `src/features.py` (25 features) + validation | Immediately |
-| **C · Pipeline + Model** | Lead (you) | `src/pipeline.py`, `src/model.py`, submissions | Immediately |
+| **A · Blocking** | **Vishwesh** | `src/normalize.py`, `src/blocking.py` + recall report | Immediately |
+| **B · Features** | **Karan** | `src/features.py` (25 features) + validation + error analysis | Immediately |
+| **C · Pipeline + Model** | **Abhijit** (lead) | `src/pipeline.py`, `src/model.py`, submissions | Immediately |
 | **D · Evaluation & Docs** | Shared rotation | `scripts/evaluate.py`, methodology doc, package | Hour 12+ |
 
 ### Ownership boundaries (avoid merge conflicts!)
-- Member 2 → only `src/normalize.py`, `src/blocking.py`, `tests/test_blocking.py`
-- Member 3 → only `src/features.py`, `tests/test_features.py`
-- Lead → everything else + final integrations
+- **Vishwesh** → only `src/normalize.py`, `src/blocking.py`, `tests/test_blocking.py`, `tests/test_normalize.py`
+- **Karan** → only `src/features.py`, `tests/test_features.py`, `scripts/evaluate.py`, `docs/feature_report.md`
+- **Abhijit** → `src/pipeline.py`, `src/model.py`, `src/training.py`, `src/data_loader.py`, final packaging
 - **Shared interfaces are frozen** (see §7) — change them only by agreement.
+- After hour 14: no direct pushes to `main` except Abhijit (submissions). Use PRs with 1 approval.
+
+➡️ Full task details: [TASK_BREAKDOWN.md](TASK_BREAKDOWN.md)
 
 ---
 
@@ -207,16 +212,16 @@ find_best_macro_f05_threshold(y_true, y_proba, s1_ids) -> (thresh, score)
 
 | Hours | Goal | Owner | Checkpoint |
 |-------|------|-------|------------|
-| **0–2** | Repo + env + dataset loaded | Lead | `git clone` works, venv ready |
-| **2–6** | Normalize + block train data | M2 + Lead | Blocking recall ≥ 95% on train |
-| **6–10** | Features + first training pairs | M3 + Lead | Feature matrix, no NaN |
-| **10–14** | **First end-to-end submission** | Lead | Uploaded to leaderboard |
+| **0–2** | Repo + env + dataset loaded | Abhijit | `git clone` works, venv ready |
+| **2–6** | Normalize + block train data | Vishwesh + Abhijit | Blocking recall ≥ 95% on train |
+| **6–10** | Features + first training pairs | Karan + Abhijit | Feature matrix, no NaN |
+| **10–14** | **First end-to-end submission** | Abhijit | Uploaded to leaderboard |
 | **14–24** | Threshold tuning, error analysis | All | Validation F_0.5 ≥ 0.85 |
-| **24–36** | Improve blocking recall + features | M2 + M3 | +2–5% score |
-| **36–48** | Model tuning, ensemble variants | Lead | Best CV score recorded |
+| **24–36** | Improve blocking recall + features | Vishwesh + Karan | +2–5% score |
+| **36–48** | Model tuning, ensemble variants | Abhijit | Best CV score recorded |
 | **48–60** | Freeze model, run test inference | All | Output files generated |
 | **60–68** | Validation script passes, docs written | All | `validate_submission.py` PASS |
-| **68–72** | Final submission + zip package | Lead | Uploaded + zipped |
+| **68–72** | Final submission + zip package | Abhijit | Uploaded + zipped |
 
 ---
 
@@ -224,14 +229,14 @@ find_best_macro_f05_threshold(y_true, y_proba, s1_ids) -> (thresh, score)
 
 | # | Finding | Status | Owner |
 |---|---------|--------|-------|
-| 1 | Legal suffix list missed `Pvt`/`Private`/`SARL`/`SAS` — fixed | ✅ Fixed | Lead |
-| 2 | `optuna.TPESampler` → `optuna.samplers.TPESampler` (v5 API) — fixed | ✅ Fixed | Lead |
-| 3 | Meta-learner was trained on validation data (leakage) — fixed with OOF stacking | ✅ Fixed | Lead |
-| 4 | `candidate_pairs.tsv` was writing final matches instead of blocking candidates — fixed | ✅ Fixed | Lead |
-| 5 | Singletons had no negatives in training — fixed (singleton hard negatives added) | ✅ Fixed | Lead |
-| 6 | **Address TF-IDF blocking generates too many false candidates** (342/484 on test) — needs tuning or gating by name similarity | 🔴 OPEN | M2 |
-| 7 | Tiny-data CV guards added (`make_cv_splits`, `_safe_ap`) | ✅ Fixed | Lead |
-| 8 | Threshold optimizes to lowest bound (0.10) on synthetic — needs investigation with real data | 🟡 OPEN | Lead |
+| 1 | Legal suffix list missed `Pvt`/`Private`/`SARL`/`SAS` — fixed | ✅ Fixed | Abhijit |
+| 2 | `optuna.TPESampler` → `optuna.samplers.TPESampler` (v5 API) — fixed | ✅ Fixed | Abhijit |
+| 3 | Meta-learner was trained on validation data (leakage) — fixed with OOF stacking | ✅ Fixed | Abhijit |
+| 4 | `candidate_pairs.tsv` was writing final matches instead of blocking candidates — fixed | ✅ Fixed | Abhijit |
+| 5 | Singletons had no negatives in training — fixed (singleton hard negatives added) | ✅ Fixed | Abhijit |
+| 6 | **Address TF-IDF blocking generates too many false candidates** (342/484 on test) — needs tuning or gating by name similarity | 🔴 OPEN | Vishwesh |
+| 7 | Tiny-data CV guards added (`make_cv_splits`, `_safe_ap`) | ✅ Fixed | Abhijit |
+| 8 | Threshold optimizes to lowest bound (0.10) on synthetic — needs investigation with real data | 🟡 OPEN | Abhijit |
 
 ### Open hypothesis for #6
 Address-based blocking is high-recall but low-precision: many businesses share cities/streets.
@@ -246,12 +251,12 @@ or raise the address TF-IDF threshold from 0.25 → 0.5.
 Amazon ML/
 ├── src/
 │   ├── data_loader.py      # TSV loading, ground-truth parsing
-│   ├── normalize.py        # name/address normalization  [M2]
-│   ├── blocking.py         # 7-layer candidate generation [M2]
-│   ├── features.py         # 25 pairwise features        [M3]
+│   ├── normalize.py        # name/address normalization  [Vishwesh]
+│   ├── blocking.py         # 7-layer candidate generation [Vishwesh]
+│   ├── features.py         # 25 pairwise features        [Karan]
 │   ├── training.py         # pairs + hard negatives
 │   ├── model.py            # OOF stacking + thresholds
-│   └── pipeline.py         # end-to-end orchestrator     [Lead]
+│   └── pipeline.py         # end-to-end orchestrator     [Abhijit]
 ├── scripts/
 │   ├── make_synthetic_data.py  # generate noisy fixtures for testing
 │   └── evaluate.py             # macro F_0.5 evaluator (leaderboard-style)
@@ -321,7 +326,7 @@ python utils/validate_submission.py --matching output/matching_results.tsv \
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Dataset not yet downloaded | Blocker | Lead to fetch from portal first thing |
+| Dataset not yet downloaded | Blocker | Abhijit to fetch from portal first thing |
 | Blocking miss on France (unseen in train) | Recall loss | Multilingual-proof normalization; no country hardcoding |
 | Threshold tuned on wrong distribution | Score loss | Tune on entity-level macro F_0.5, validate on test-like split |
 | Submission format error | **Rejection** | Always run `validate_submission.py` |
@@ -332,9 +337,9 @@ python utils/validate_submission.py --matching output/matching_results.tsv \
 
 ## 14. FIRST ACTIONS (right now)
 
-1. **Lead:** obtain the dataset from the competition portal → `data/dataset/`
-2. **M2:** tune address-blocking precision (issue #6) — gate address candidates by name similarity
-3. **M3:** verify features on real names/addresses from the dataset; report any NaN or constant columns
+1. **Abhijit:** obtain the dataset from the competition portal → `data/dataset/`
+2. **Vishwesh:** tune address-blocking precision (issue #6) — gate address candidates by name similarity
+3. **Karan:** verify features on real names/addresses from the dataset; report any NaN or constant columns
 4. **All:** run `python tests/test_smoke.py` to confirm local setup works before touching real data
 
 ---
