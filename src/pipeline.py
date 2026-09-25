@@ -140,26 +140,48 @@ class EntityResolutionPipeline:
             n_trials=3 if self.fast_mode else 20,
         )
         
-        # Step 8: Calibrate + optimize threshold (macro F_0.5 — matches leaderboard)
-        print("\n[8/10] Calibrating probabilities + optimizing macro F_0.5...")
+        # Step 8: Honest validation on held-out entities — full candidate sets
+        # + decision layer — and calibration on that same distribution. The
+        # training-pair validation set is far easier (0.99 vs 0.81 held-out),
+        # and expected-F0.5 decisions depend on calibrated probabilities.
+        print("\n[8/10] Validation inference (held-out entities, full candidates)...")
         try:
-            from .decision import fit_isotonic
-            self.calibrator = fit_isotonic(meta_val_proba, y_val)
-            cal_val_proba = self.calibrator(meta_val_proba)
-            print("  Isotonic calibration fitted on validation predictions")
-        except Exception as exc:  # noqa: BLE001 — calibration must never block a run
-            print(f"  WARNING: calibration failed ({exc}); using raw probabilities")
-            self.calibrator = None
-            cal_val_proba = meta_val_proba
+            from .decision import (
+                fit_isotonic, select_sets_expected_f05, macro_f05,
+            )
+            val_entity_ids = set(val_pairs["s1_entity_id"])
+            val_out = self._validation_inference(
+                candidates_train, ground_truth, val_entity_ids)
+            self.calibrator = fit_isotonic(
+                val_out["meta_proba"], val_out["labels"])
+            cal_val = self.calibrator(val_out["meta_proba"])
+            decisions = select_sets_expected_f05(
+                val_out["pair_s1_ids"], val_out["pair_cand_ids"], cal_val,
+                anchor_ids=val_out["val_s1_ids"])
+            honest_macro = macro_f05(
+                val_out["truth"],
+                {sid: set(decisions.get(sid, []))
+                 for sid in val_out["val_s1_ids"]},
+            )
+            print(f"  Honest val macro F_0.5 (decision layer, calibrated): "
+                  f"{honest_macro:.4f}")
+        except Exception as exc:  # noqa: BLE001 — validation must never block a run
+            print(f"  WARNING: validation inference failed ({exc}); "
+                  f"falling back to pair-level calibration")
+            try:
+                from .decision import fit_isotonic
+                self.calibrator = fit_isotonic(meta_val_proba, y_val)
+            except Exception:  # noqa: BLE001
+                self.calibrator = None
 
+        # Pair-level metrics (compatibility/reporting only)
         val_s1_ids = val_features["s1_entity_id"].tolist()
         self.best_threshold, best_macro = find_best_macro_f05_threshold(
-            y_val, cal_val_proba, val_s1_ids
+            y_val, meta_val_proba, val_s1_ids
         )
         _, best_pair_f05 = find_best_f05_threshold(y_val, meta_val_proba)
-        print(f"Best threshold: {self.best_threshold:.2f}")
-        print(f"  macro F_0.5 (val, calibrated): {best_macro:.4f}")
-        print(f"  pair  F_0.5 (val, raw):        {best_pair_f05:.4f}")
+        print(f"  pair-level: threshold={self.best_threshold:.2f} "
+              f"macro F_0.5={best_macro:.4f} pair F_0.5={best_pair_f05:.4f}")
         
         # Step 9: Run inference on test
         print("\n[9/10] Running inference on test set...")
@@ -288,6 +310,126 @@ class EntityResolutionPipeline:
         
         return candidates
     
+    def _predict_pair_proba(
+        self,
+        s1_df: pd.DataFrame,
+        s2_s3_df: pd.DataFrame,
+        pair_s1_idx: list,
+        pair_s2_idx: list,
+    ):
+        """Features + ensemble + meta probabilities for explicit candidate pairs.
+
+        Returns (features_df, meta_proba). Dense cosine is always computed when
+        use_dense_cap is on — the model was trained with real values.
+        """
+        s1_names = s1_df["business_name_clean"].fillna("").tolist()
+        s1_addrs = s1_df["business_address_clean"].fillna("").tolist()
+        s1_countries = s1_df["country_clean"].fillna("").tolist()
+        s2_s3_names = s2_s3_df["business_name_clean"].fillna("").tolist()
+        s2_s3_addrs = s2_s3_df["business_address_clean"].fillna("").tolist()
+        s2_s3_countries = s2_s3_df["country_clean"].fillna("").tolist()
+        s2_s3_ids = s2_s3_df["entity_id"].tolist()
+
+        pairs_df = pd.DataFrame({"s1_idx": pair_s1_idx, "s2_s3_idx": pair_s2_idx})
+        if len(pairs_df) > 20_000:
+            features_df = compute_features_vectorized(
+                pairs_df, s1_names, s1_addrs, s1_countries,
+                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+            )
+        else:
+            features_df = compute_features_batch(
+                pairs_df, s1_names, s1_addrs, s1_countries,
+                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
+            )
+
+        if self.use_dense_cap:
+            try:
+                from .dense_blocking import MULTILINGUAL_MODEL, encode_texts
+                q_emb = encode_texts(
+                    s1_names, model_name=MULTILINGUAL_MODEL,
+                    cache_dir=self.embedding_cache, role="query",
+                    show_progress=False,
+                )
+                g_emb = encode_texts(
+                    s2_s3_names, model_name=MULTILINGUAL_MODEL,
+                    cache_dir=self.embedding_cache, role="target",
+                    show_progress=False,
+                )
+                s1_arr = pairs_df["s1_idx"].to_numpy()
+                s2_arr = pairs_df["s2_s3_idx"].to_numpy()
+                cos = np.empty(len(pairs_df), dtype=np.float32)
+                step = 200_000
+                for start in range(0, len(pairs_df), step):
+                    end = min(start + step, len(pairs_df))
+                    cos[start:end] = np.einsum(
+                        "ij,ij->i",
+                        q_emb[s1_arr[start:end]], g_emb[s2_arr[start:end]],
+                    )
+                features_df["name_dense_cosine"] = cos
+            except Exception as exc:  # noqa: BLE001 — never block inference
+                print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
+
+        X = features_df[FEATURE_NAMES].values
+        lgb_proba = self.models["lgb"]["model"].predict_proba(X)[:, 1]
+        xgb_proba = self.models["xgb"]["model"].predict_proba(X)[:, 1]
+        rf_proba = self.models["rf"]["model"].predict_proba(X)[:, 1]
+        X_meta = np.column_stack([lgb_proba, xgb_proba, rf_proba])
+        meta_proba = self.meta_model.predict_proba(X_meta)[:, 1]
+        return features_df, meta_proba
+
+    def _validation_inference(
+        self,
+        candidates_train: Dict[int, set],
+        ground_truth: Dict[str, list],
+        val_entity_ids: set,
+    ) -> dict:
+        """Honest validation: full candidate sets + model + decision layer on
+        held-out entities.
+
+        The training-pair validation set (positives + sampled negatives) is far
+        easier than the real 50-candidates/S1 distribution (val macro F_0.5
+        0.99 vs 0.81 held-out). Calibration and reporting must use the full
+        candidate distribution or the expected-F0.5 decision is misled.
+        """
+        from .decision import select_sets_expected_f05, macro_f05
+
+        s1_df = self.train_data["train_s1"]
+        s2_s3 = combine_sources(
+            self.train_data["train_s2"], self.train_data["train_s3"]
+        )
+        s1_ids = s1_df["entity_id"].tolist()
+        s2_ids = s2_s3["entity_id"].tolist()
+        s2_pos = {e: i for i, e in enumerate(s2_ids)}
+
+        val_idx = [i for i, sid in enumerate(s1_ids) if sid in val_entity_ids]
+        pair_s1_idx, pair_s2_idx = [], []
+        for i in val_idx:
+            for cid in candidates_train.get(i, ()):
+                pair_s1_idx.append(i)
+                pair_s2_idx.append(s2_pos[cid])
+
+        print(f"  Validation inference: {len(val_idx):,} entities, "
+              f"{len(pair_s1_idx):,} candidate pairs")
+        features_df, meta_proba = self._predict_pair_proba(
+            s1_df, s2_s3, pair_s1_idx, pair_s2_idx)
+
+        val_s1_ids = [s1_ids[i] for i in val_idx]
+        pair_s1_ids = [s1_ids[i] for i in features_df["s1_idx"].tolist()]
+        pair_cand_ids = features_df["s2_s3_id"].tolist()
+        labels = np.array([
+            1 if cid in set(ground_truth.get(sid, [])) else 0
+            for sid, cid in zip(pair_s1_ids, pair_cand_ids)
+        ], dtype=np.int8)
+        truth = {sid: set(ground_truth.get(sid, [])) for sid in val_s1_ids}
+        return {
+            "pair_s1_ids": pair_s1_ids,
+            "pair_cand_ids": pair_cand_ids,
+            "meta_proba": meta_proba,
+            "labels": labels,
+            "val_s1_ids": val_s1_ids,
+            "truth": truth,
+        }
+
     def _run_inference(self):
         """Run inference on test set."""
         s2_s3_test = combine_sources(
@@ -317,70 +459,11 @@ class EntityResolutionPipeline:
             self.test_predictions = {sid: [] for sid in self.test_data["test_s1"]["entity_id"]}
             return
         
-        # Compute features
-        s1_df = self.test_data["test_s1"]
-        s1_names = s1_df["business_name_clean"].fillna("").tolist()
-        s1_addrs = s1_df["business_address_clean"].fillna("").tolist()
-        s1_countries = s1_df["country_clean"].fillna("").tolist()
-        
-        s2_s3_names = s2_s3_test["business_name_clean"].fillna("").tolist()
-        s2_s3_addrs = s2_s3_test["business_address_clean"].fillna("").tolist()
-        s2_s3_countries = s2_s3_test["country_clean"].fillna("").tolist()
-        s2_s3_ids = s2_s3_test["entity_id"].tolist()
-        
+        # Compute features + ensemble probabilities
         print(f"  Computing features for {len(pair_s1_idx)} candidate pairs...")
-        pairs_df = pd.DataFrame({"s1_idx": pair_s1_idx, "s2_s3_idx": pair_s2_idx})
-        if len(pairs_df) > 20_000:
-            print("  (vectorized path)")
-            features_df = compute_features_vectorized(
-                pairs_df, s1_names, s1_addrs, s1_countries,
-                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
-            )
-        else:
-            features_df = compute_features_batch(
-                pairs_df, s1_names, s1_addrs, s1_countries,
-                s2_s3_names, s2_s3_addrs, s2_s3_countries, s2_s3_ids,
-            )
+        features_df, meta_proba = self._predict_pair_proba(
+            self.test_data["test_s1"], s2_s3_test, pair_s1_idx, pair_s2_idx)
 
-        # Dense semantic cosine must match training-time features (the model
-        # was trained with real values — never leave this at the 0.0 default).
-        if self.use_dense_cap:
-            try:
-                from .dense_blocking import MULTILINGUAL_MODEL, encode_texts
-                q_emb = encode_texts(
-                    s1_names, model_name=MULTILINGUAL_MODEL,
-                    cache_dir=self.embedding_cache, role="query",
-                    show_progress=False,
-                )
-                g_emb = encode_texts(
-                    s2_s3_names, model_name=MULTILINGUAL_MODEL,
-                    cache_dir=self.embedding_cache, role="target",
-                    show_progress=False,
-                )
-                s1_arr = pairs_df["s1_idx"].to_numpy()
-                s2_arr = pairs_df["s2_s3_idx"].to_numpy()
-                cos = np.empty(len(pairs_df), dtype=np.float32)
-                step = 200_000
-                for start in range(0, len(pairs_df), step):
-                    end = min(start + step, len(pairs_df))
-                    cos[start:end] = np.einsum(
-                        "ij,ij->i",
-                        q_emb[s1_arr[start:end]], g_emb[s2_arr[start:end]],
-                    )
-                features_df["name_dense_cosine"] = cos
-            except Exception as exc:  # noqa: BLE001 — never block inference
-                print(f"  WARNING: dense feature unavailable ({exc}); using 0.0")
-        
-        X_test = features_df[FEATURE_NAMES].values
-        
-        # Stack base predictions
-        lgb_proba = self.models["lgb"]["model"].predict_proba(X_test)[:, 1]
-        xgb_proba = self.models["xgb"]["model"].predict_proba(X_test)[:, 1]
-        rf_proba = self.models["rf"]["model"].predict_proba(X_test)[:, 1]
-        
-        X_meta = np.column_stack([lgb_proba, xgb_proba, rf_proba])
-        meta_proba = self.meta_model.predict_proba(X_meta)[:, 1]
-        
         # Calibrate before the decision (isotonic fitted on validation)
         if self.calibrator is not None:
             decision_proba = self.calibrator(meta_proba)
