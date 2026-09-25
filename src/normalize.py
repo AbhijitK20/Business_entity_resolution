@@ -7,6 +7,7 @@ measurements).
 """
 import re
 import unicodedata
+import warnings
 import pandas as pd
 from typing import Optional
 
@@ -42,9 +43,29 @@ def _translit_run(match: "re.Match") -> str:
     """Transliterate one Indic run to Latin (ITRANS + schwa deletion)."""
     text = match.group(0).replace("\u200c", "").replace("\u200d", "")
     script_name = next((_script_of(c) for c in text if _script_of(c)), None)
-    if script_name is None or not _HAS_INDIC:
+    if script_name is None:
         return text
-    script = getattr(sanscript, script_name.upper())
+    if not _HAS_INDIC:
+        # Graceful fallback (text is returned unchanged) — but never silently:
+        # one warning per run so a missing dependency cannot masquerade as a
+        # successful transliteration. Not installed, not requirements.txt edited.
+        warnings.warn(
+            "indic-transliteration is not installed: Indic-script text was left "
+            "untransliterated (graceful fallback, NOT a successful transliteration). "
+            "Install 'indic-transliteration' to enable V1 cross-script normalization.",
+            RuntimeWarning,
+        )
+        return text
+    script = getattr(sanscript, script_name.upper(), None)
+    if script is None and script_name == "oriya":
+        script = getattr(sanscript, "ODIA", None)  # newer scheme name
+    if script is None:
+        warnings.warn(
+            f"indic_transliteration exposes no scheme for {script_name!r}: "
+            "text left untransliterated (graceful fallback).",
+            RuntimeWarning,
+        )
+        return text
     out = _itrans(text, script, sanscript.ITRANS)
     # word-final schwa deletion: rama -> ram, marketinga -> marketing
     out = re.sub(r"(?<=[^aeiouAEIOU\s])a\b", "", out)
@@ -226,19 +247,34 @@ def normalize_country(country: Optional[str]) -> str:
     return str(country).strip().lower()
 
 
+def _is_non_latin_value(value) -> int:
+    """is_non_latin() over one raw cell, tolerating None/NaN/numeric values."""
+    if value is None or pd.isna(value):
+        return 0
+    return is_non_latin(str(value))
+
+
 def apply_normalization(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply normalization to all relevant columns in a dataframe."""
+    """Apply normalization to all relevant columns in a dataframe.
+
+    Normalized columns are written alongside the raw ones (raw is never
+    mutated). Script flags are computed from the RAW text — after
+    transliteration the clean text is Latin by construction, so the flag would
+    otherwise always be 0 (BLUEPRINT §2.1 "script flag feature").
+    """
     df = df.copy()
-    
+
     if "business_name" in df.columns:
         df["business_name_clean"] = df["business_name"].apply(normalize_name)
-    
+        df["business_name_is_non_latin"] = df["business_name"].apply(_is_non_latin_value)
+
     if "business_address" in df.columns:
         df["business_address_clean"] = df["business_address"].apply(normalize_address)
-    
+        df["business_address_is_non_latin"] = df["business_address"].apply(_is_non_latin_value)
+
     if "country" in df.columns:
         df["country_clean"] = df["country"].apply(normalize_country)
-    
+
     return df
 
 

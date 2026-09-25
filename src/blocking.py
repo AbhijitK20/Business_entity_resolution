@@ -121,21 +121,40 @@ def tfidf_blocking_candidates(
     return candidates
 
 
+def _take_bucket(
+    candidates: Dict[int, Set[str]],
+    q_idx: int,
+    bucket: List[str],
+    max_bucket,
+) -> None:
+    """Add an inverted-index bucket to candidates iff it is non-empty and fits.
+
+    Oversized buckets are dropped as too generic — the same convention as the
+    key legs (BLUEPRINT §2.2: "drop buckets >30"). ``max_bucket=None`` disables
+    the cap.
+    """
+    if bucket and (max_bucket is None or len(bucket) <= max_bucket):
+        candidates[q_idx].update(bucket)
+
+
 def phonetic_blocking(
     query_names: List[str],
     target_names: List[str],
     target_ids: List[str],
+    max_bucket: int = 30,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using Soundex + Metaphone blocking.
-    
+
     From canonmap: phonetic and soundex blocking strategies.
+    Soundex/metaphone buckets larger than ``max_bucket`` are dropped as too
+    generic (key-leg convention), so a hot bucket cannot explode candidates.
     """
     candidates = defaultdict(set)
-    
+
     # Build target index
     target_soundex = defaultdict(list)
     target_metaphone = defaultdict(list)
-    
+
     for t_idx, (name, tid) in enumerate(zip(target_names, target_ids)):
         sx = soundex_key(name)
         mp = metaphone_key(name)
@@ -143,17 +162,14 @@ def phonetic_blocking(
             target_soundex[sx].append(tid)
         if mp:
             target_metaphone[mp].append(tid)
-    
+
     # Query
     for q_idx, name in enumerate(query_names):
         sx = soundex_key(name)
         mp = metaphone_key(name)
-        
-        if sx in target_soundex:
-            candidates[q_idx].update(target_soundex[sx])
-        if mp in target_metaphone:
-            candidates[q_idx].update(target_metaphone[mp])
-    
+        _take_bucket(candidates, q_idx, target_soundex.get(sx), max_bucket)
+        _take_bucket(candidates, q_idx, target_metaphone.get(mp), max_bucket)
+
     return candidates
 
 
@@ -161,26 +177,28 @@ def initialism_blocking(
     query_names: List[str],
     target_names: List[str],
     target_ids: List[str],
+    max_bucket: int = 30,
 ) -> Dict[int, Set[str]]:
     """Generate candidates using initialism matching.
-    
+
     From canonmap: bidirectional initialism matching.
+    Initialism buckets larger than ``max_bucket`` are dropped as too generic
+    (key-leg convention).
     """
     candidates = defaultdict(set)
-    
+
     # Build target index
     target_initialisms = defaultdict(list)
     for t_idx, (name, tid) in enumerate(zip(target_names, target_ids)):
         init = initialism_key(name)
         if init:
             target_initialisms[init].append(tid)
-    
+
     # Query
     for q_idx, name in enumerate(query_names):
         init = initialism_key(name)
-        if init in target_initialisms:
-            candidates[q_idx].update(target_initialisms[init])
-    
+        _take_bucket(candidates, q_idx, target_initialisms.get(init), max_bucket)
+
     return candidates
 
 
@@ -353,7 +371,10 @@ def cap_candidates(
     """Cap each query's candidate set to at most max_per_query entries.
 
     ``keep_fn(s1_idx, cand_id) -> float`` optionally scores candidates for
-    prioritization; higher scores survive. Default keeps insertion order.
+    prioritization: higher scores survive, ties break on candidate ID.
+    Without ``keep_fn`` survivors are the lowest candidate IDs — candidate sets
+    are Python sets whose iteration order depends on the per-process hash seed,
+    so an explicit sort is what makes capping run-to-run reproducible.
 
     Used as a final per-entity budget guard (masterplan v2 §8).
     """
@@ -364,10 +385,12 @@ def cap_candidates(
         if len(cands) <= max_per_query:
             capped[q_idx] = set(cands)
             continue
-        cand_list = list(cands)
         if keep_fn is not None:
-            cand_list.sort(key=lambda c: keep_fn(q_idx, c), reverse=True)
-        capped[q_idx] = set(cand_list[:max_per_query])
+            # score desc, then candidate ID asc -> fully deterministic
+            kept = sorted(cands, key=lambda c: (-keep_fn(q_idx, c), str(c)))
+        else:
+            kept = sorted(cands, key=str)
+        capped[q_idx] = set(kept[:max_per_query])
     return capped
 
 
@@ -521,6 +544,7 @@ def key_blocking(
     address_key_min_len: int = 12,
     max_bucket: int = 30,
     max_addr_bucket: int = 200,
+    max_pin_bucket: int = 30,
 ) -> Dict[int, Set[str]]:
     """Exact-key blocking legs (SABER/vaibhav/resolvers consensus).
 
@@ -528,7 +552,9 @@ def key_blocking(
       (bucket capped at max_addr_bucket — shared buildings/malls)
     - name key: core name (legal-stripped) + last two address tokens
       (buckets > max_bucket dropped as too generic)
-    - PIN/ZIP key: 5-6 digit runs in the address (India PIN / US ZIP)
+    - PIN/ZIP key: 5-6 digit runs in the address (India PIN / US ZIP);
+      buckets > max_pin_bucket dropped as too generic (a PIN area is coarser
+      than an address, so it gets the stricter cap)
     """
     candidates: Dict[int, Set[str]] = defaultdict(set)
     gallery_ids = gallery_df["entity_id"].tolist()
@@ -551,15 +577,13 @@ def key_blocking(
                                   s1_df["business_name_clean"].fillna("").tolist(),
                                   s1_df["business_address_clean"].fillna("").tolist()):
         for k in ([addr] if len(addr) >= address_key_min_len else []):
-            bucket = addr_index.get(k, [])
-            if 0 < len(bucket) <= max_addr_bucket:
-                candidates[s1_idx].update(bucket)
+            _take_bucket(candidates, s1_idx, addr_index.get(k), max_addr_bucket)
         for k in _name_core_key(name, addr):
-            bucket = name_index.get(k, [])
-            if 0 < len(bucket) <= max_bucket:
-                candidates[s1_idx].update(bucket)
+            _take_bucket(candidates, s1_idx, name_index.get(k), max_bucket)
         for k in _pin_keys(addr):
-            candidates[s1_idx].update(pin_index.get(k, []))
+            bucket = pin_index.get(k, [])
+            if max_pin_bucket is None or len(bucket) <= max_pin_bucket:
+                candidates[s1_idx].update(bucket)
 
     return candidates
 
@@ -592,21 +616,31 @@ def measure_blocking_quality(
 
     From armory: blocking recall = ceiling on fusion recall.
 
+    Recall iterates the GROUND-TRUTH roster: every truth match counts in the
+    denominator, including matches for S1s that produced zero candidates.
+    (Iterating ``candidates`` instead silently dropped those S1s and inflated
+    recall.)
+
     Args:
         candidates: {s1_idx: set of candidate entity IDs}
         ground_truth: {s1_entity_id: [matched_ids]}
         total_possible_pairs: |S1| * |S2+S3|
-        s1_ids: list of S1 entity IDs indexed by position (required to map idx -> id)
+        s1_ids: list of S1 entity IDs indexed by position (required to map
+            idx -> id; without it no truth S1 resolves to a candidate set and
+            recall evaluates to 0)
     """
     matches_retained = 0
     total_matches = 0
 
-    for q_idx, candidate_ids in candidates.items():
-        if s1_ids is None or q_idx >= len(s1_ids):
-            continue
-        s1_id = s1_ids[q_idx]
-        matched_ids = ground_truth.get(s1_id, [])
+    pos_of_id = {}
+    if s1_ids is not None:
+        for pos, s1_id in enumerate(s1_ids):
+            pos_of_id[s1_id] = pos
+
+    for s1_id, matched_ids in ground_truth.items():
         total_matches += len(matched_ids)
+        q_idx = pos_of_id.get(s1_id)
+        candidate_ids = candidates.get(q_idx, set()) if q_idx is not None else set()
         matches_retained += len(set(matched_ids) & set(candidate_ids))
 
     candidate_count = sum(len(v) for v in candidates.values())
